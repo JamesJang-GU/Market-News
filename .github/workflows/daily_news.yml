@@ -1,0 +1,31 @@
+name: Daily Logistics News Briefing
+
+on:
+  schedule:
+    # 한국 시간 기준 매일 오전 06:00 실행 (UTC 기준 전날 21:00)
+    - cron: '0 21 * * *'
+  workflow_dispatch: # GitHub 웹사이트에서 버튼을 눌러 수동 실행도 가능
+
+jobs:
+  run-briefing:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: 코드 체크아웃
+      uses: actions/checkout@v4
+
+    - name: 파이썬 설정
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+
+    - name: 패키지 설치
+      run: |
+        pip install -r requirements.txt
+
+    - name: 뉴스 브리핑 스크립트 실행
+      env:
+        ALPHA_API_KEY: ${{ secrets.ALPHA_API_KEY }}
+        NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+        NOTION_PARENT_PAGE_ID: ${{ secrets.NOTION_PARENT_PAGE_ID }}
+      run: python news_briefing.py
