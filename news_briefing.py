@@ -13,13 +13,12 @@ NOTION_PARENT_PAGE_ID = os.environ.get("NOTION_PARENT_PAGE_ID")  # 노션 DB ID
 # 설정
 ALPHA_URL = "https://workspace.kr.pwc.com/api/workspace/coding_agent/v1/chat/completions"
 NOTION_API_URL = "https://api.notion.com/v1/pages"
-NOTION_DB_URL = f"https://api.notion.com/v1/databases/{NOTION_PARENT_PAGE_ID}"
 
 def fetch_ksg_news():
-    """코리아쉬핑가제트(KSG) 메인 뉴스 크롤링 (5개)"""
+    """코리아쉬핑가제트(KSG) 메인 뉴스 크롤링"""
     url = "https://ksg.co.kr/news/main_news.jsp"
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     }
     articles = []
     try:
@@ -64,7 +63,6 @@ def fetch_google_logistics_news(count=5):
     rss_url = f"https://news.google.com/rss/search?q={encoded_query}&hl=ko&gl=KR&ceid=KR:ko"
     
     feed = feedparser.parse(rss_url)
-    
     articles = []
     for entry in feed.entries[:count]:
         articles.append({
@@ -98,9 +96,9 @@ def analyze_with_alpha_ai(articles):
     - 3점/2점: 업계 동향, 신기술 도입, 중견 기업 실적 등
     - 1점: 일반 홍보성, 참고 수준의 단신
 
-    [출력 정렬 규칙 - 매우 중요]
+    [출력 정렬 규칙]
     - 실무 영향력이 가장 큰 기사를 1번으로 배치하여 내림차순 정렬합니다.
-    - 각 기사에는 반드시 원본 기사 번호를 번호: N 형식으로 명시합니다. (원문 번호를 반드시 유지)
+    - 각 기사에는 반드시 원본 기사 번호를 번호: N 형식으로 명시합니다.
 
     [출력 형식 예시]
     ---ARTICLE_START---
@@ -129,30 +127,14 @@ def analyze_with_alpha_ai(articles):
     try:
         response = requests.post(ALPHA_URL, headers=headers, json=payload)
         response.raise_for_status()
-        result = response.json()
-        return result['choices'][0]['message']['content']
+        return response.json()['choices'][0]['message']['content']
     except Exception as e:
         print(f"Alpha AI 호출 실패: {e}")
         return None
 
-def get_db_title_property_name(headers):
-    """노션 DB에서 '제목(title)' 역할을 하는 컬럼(Property)의 정확한 이름을 찾아옴"""
-    try:
-        res = requests.get(NOTION_DB_URL, headers=headers)
-        if res.status_code == 200:
-            properties = res.json().get("properties", {})
-            for prop_name, prop_data in properties.items():
-                if prop_data.get("type") == "title":
-                    return prop_name
-        else:
-            print(f"⚠️ DB 정보를 읽을 수 없습니다 ({res.status_code}): {res.text}")
-    except Exception as e:
-        print(f"⚠️ DB 정보 조회 실패: {e}")
-    return "Name" # 기본 fallback 값
-
-def create_notion_page(articles, ai_analysis):
+def save_articles_to_notion_db(articles, ai_analysis):
+    """기사 1개당 노션 DB의 1개 행(Row)으로 적재"""
     today_str = datetime.datetime.now().strftime("%Y-%m-%d")
-    page_title = f"📦 [{today_str}] 해운·물류 통합 브리핑 (TOP 10)"
 
     headers = {
         "Authorization": f"Bearer {NOTION_TOKEN}",
@@ -160,22 +142,8 @@ def create_notion_page(articles, ai_analysis):
         "Notion-Version": "2022-06-28"
     }
 
-    # DB의 제목 컬럼 이름 파악 ('이름', '제목', 'Name' 등 자동 감지)
-    title_prop_name = get_db_title_property_name(headers)
-
-    children_blocks = [
-        {
-            "object": "block",
-            "type": "callout",
-            "callout": {
-                "rich_text": [{"type": "text", "text": {"content": f"실무 영향력이 큰 순서대로 정렬된 물류 통합 브리핑입니다. (작성일: {today_str})"}}],
-                "icon": {"emoji": "🚢"}
-            }
-        },
-        {"object": "block", "type": "divider", "divider": {}}
-    ]
-
     parsed_articles = ai_analysis.split("---ARTICLE_START---")
+    success_count = 0
 
     for art_text in parsed_articles[1:]:
         parsed = {}
@@ -193,78 +161,32 @@ def create_notion_page(articles, ai_analysis):
         except (ValueError, TypeError):
             continue
 
-        rank = parsed.get("순위", "?")
         importance = parsed.get("중요도", "3")
         category = parsed.get("카테고리", "종합·공급망")
         summary = parsed.get("요약", "요약 정보 없음")
         insight = parsed.get("시사점", "시사점 정보 없음")
 
-        # 별 개수 표시
+        # 별점 가공 (예: 중요도 4점 -> ★★★★)
         stars = "★" * int(importance) if importance.isdigit() else "★3"
+        title_text = f"[{stars}] {orig_article['title']}"
 
-        children_blocks.append({
-            "object": "block",
-            "type": "heading_3",
-            "heading_3": {
-                "rich_text": [
-                    {"type": "text", "text": {"content": f"{rank}위 {stars} [{category}] "}},
-                    {"type": "text", "text": {"content": orig_article['title'], "link": {"url": orig_article['link']}}}
-                ]
+        # 페이지 본문 (클릭해서 들어갔을 때 보일 내용)
+        children_blocks = [
+            {
+                "object": "block",
+                "type": "callout",
+                "callout": {
+                    "rich_text": [{"type": "text", "text": {"content": "💡 AI 시사점 분석"}}],
+                    "icon": {"emoji": "💡"}
+                }
+            },
+            {
+                "object": "block",
+                "type": "paragraph",
+                "paragraph": {
+                    "rich_text": [{"type": "text", "text": {"content": insight}}]
+                }
             }
-        })
+        ]
 
-        children_blocks.append({
-            "object": "block",
-            "type": "bulleted_list_item",
-            "bulleted_list_item": {
-                "rich_text": [
-                    {"type": "text", "text": {"content": "📌 요약: ", "annotations": {"bold": True}}},
-                    {"type": "text", "text": {"content": summary}}
-                ]
-            }
-        })
-        children_blocks.append({
-            "object": "block",
-            "type": "bulleted_list_item",
-            "bulleted_list_item": {
-                "rich_text": [
-                    {"type": "text", "text": {"content": "💡 시사점: ", "annotations": {"bold": True}}},
-                    {"type": "text", "text": {"content": insight}}
-                ]
-            }
-        })
-
-    # ★ DB 적재용 페이로드 (database_id 규격 반영)
-    payload = {
-        "parent": {
-            "type": "database_id",
-            "database_id": NOTION_PARENT_PAGE_ID
-        },
-        "properties": {
-            title_prop_name: {
-                "title": [{"type": "text", "text": {"content": page_title}}]
-            }
-        },
-        "children": children_blocks
-    }
-
-    res = requests.post(NOTION_API_URL, headers=headers, json=payload)
-    if res.status_code == 200:
-        print("✅ 성공: 노션 데이터베이스에 새로운 브리핑 페이지 생성 완료!")
-    else:
-        print(f"❌ 실패: 노션 페이지 생성 오류 -> {res.text}")
-
-if __name__ == "__main__":
-    print("1. KSG 및 물류 뉴스 수집 중...")
-    articles = fetch_all_news()
-    print(f"총 {len(articles)}개 기사 수집 완료.")
-
-    if articles:
-        print("2. Alpha AI로 영역별 분류 및 분석 중...")
-        ai_analysis = analyze_with_alpha_ai(articles)
-        
-        if ai_analysis:
-            print("3. 노션 DB로 전송 중...")
-            create_notion_page(articles, ai_analysis)
-        else:
-            print("AI 분석 실패")
+        # ★ 
