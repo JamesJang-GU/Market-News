@@ -213,7 +213,7 @@ def save_to_notion(articles, items):
             "properties": {
                 "제목": {"title": [{"type": "text", "text": {"content": title_text}}]},
                 "날짜": {"date": {"start": today_str}},
-                "분류": {"select": {"name": it["category"]}},
+                "분류": {"multi_select": [{"name": it["category"]}]},
                 "요약": {"rich_text": [{"type": "text", "text": {"content": clip(it["summary"])}}]},
                 "URL": {"url": art["link"]},
             },
