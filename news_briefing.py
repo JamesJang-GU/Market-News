@@ -33,7 +33,7 @@ def decode_google_news_url(url):
             if decoded and isinstance(decoded, dict) and decoded.get("decoded_url"):
                 return decoded["decoded_url"]
         except Exception as e:
-            print(f"구글 URL 디코딩 오류: {e}")
+            print(f"구글 URL 디코딩 오류: {e}", flush=True)
     return url
 
 def extract_article_details(entry):
@@ -45,7 +45,6 @@ def extract_article_details(entry):
     if hasattr(entry, 'summary'):
         rss_snippet = BeautifulSoup(entry.summary, 'html.parser').get_text().strip()
 
-    # 1. 구글 뉴스 인코딩 해제
     real_url = decode_google_news_url(entry.link)
     article_text = ""
     
@@ -54,7 +53,6 @@ def extract_article_details(entry):
         res.encoding = res.apparent_encoding or 'utf-8'
         soup = BeautifulSoup(res.text, 'html.parser')
         
-        # 불필요한 태그 제거
         for tag in soup(["script", "style", "header", "footer", "nav", "aside", "form"]):
             tag.decompose()
             
@@ -63,25 +61,12 @@ def extract_article_details(entry):
         paragraphs = [p.get_text().strip() for p in target.find_all('p') if len(p.get_text().strip()) > 30]
         article_text = "\n".join(paragraphs)
     except Exception as e:
-        print(f"원문 본문 크롤링 실패 ({real_url}): {e}")
+        print(f"원문 본문 크롤링 실패 ({real_url}): {e}", flush=True)
 
     if not article_text or len(article_text) < 50:
         article_text = rss_snippet if rss_snippet else "원문 링크 참조 필요"
 
     return real_url, article_text
-
-def fetch_valid_models_from_api(base_url, headers):
-    """API의 /models 엔드포인트를 통해 활성화된 모델목록 자동 가져오기"""
-    try:
-        models_endpoint = base_url.replace("/chat/completions", "/models")
-        res = requests.get(models_endpoint, headers=headers, timeout=5)
-        if res.status_code == 200:
-            data = res.json()
-            if "data" in data and isinstance(data["data"], list):
-                return [item["id"] for item in data["data"] if "id" in item]
-    except Exception:
-        pass
-    return []
 
 def get_ai_analysis(news_list):
     """PwC Alpha AI 모델을 이용하여 뉴스 요약/시사점/하이라이트 추출"""
@@ -91,28 +76,15 @@ def get_ai_analysis(news_list):
         "Content-Type": "application/json"
     }
     
-    # 1. API 동적 모델 탐색
-    api_models = fetch_valid_models_from_api(base_url, headers)
-    
-    # 2. 대시보드 라벨 및 별칭 후보군
-    candidate_models = [
+    models_to_try = [
+        "Gemini_3.1_Pro",
+        "gemini-3.1-pro-preview",
         "Default",
-        "default",
         "gemini-3.7-flash",
         "Processing",
-        "gemini-3.1-flash-lite-preview",
         "Coding",
-        "glm-5.3-flash",
-        "GPT_5.6_Sol",
-        "gpt-5.6-sol",
-        "Sonnet"
+        "GPT_5.6_Sol"
     ]
-    
-    # 순서 유지 결합
-    models_to_try = []
-    for m in api_models + candidate_models:
-        if m not in models_to_try:
-            models_to_try.append(m)
 
     articles_payload = ""
     for i, news in enumerate(news_list):
@@ -147,22 +119,25 @@ def get_ai_analysis(news_list):
         }
         
         try:
-            print(f"[{model_name}] 모델로 AI 분석 시도 중...")
+            print(f"[{model_name}] 모델로 AI 분석 시도 중...", flush=True)
             response = requests.post(base_url, headers=headers, json=payload, timeout=30)
             if response.status_code == 200:
                 result = response.json()
                 if 'choices' in result and len(result['choices']) > 0:
-                    print(f"SUCCESS: [{model_name}] 모델로 AI 분석 성공!")
-                    return result['choices'][0]['message']['content']
+                    print(f"SUCCESS: [{model_name}] 모델로 AI 분석 성공!", flush=True)
+                    content = result['choices'][0]['message']['content']
+                    # 마크다운 코드 블록 제거
+                    content = re.sub(r'```[a-zA-Z]*', '', content).replace('```', '').strip()
+                    return content
             
-            print(f"FAIL: [{model_name}] 응답 코드 {response.status_code} - {response.text}")
+            print(f"FAIL: [{model_name}] 응답 코드 {response.status_code}", flush=True)
         except Exception as e:
-            print(f"ERROR: [{model_name}] 요청 오류 - {e}")
+            print(f"ERROR: [{model_name}] 요청 오류 - {e}", flush=True)
 
     return None
 
 def add_to_notion(title, url, category, summary, implication, highlights, stars, article_content):
-    """노션 데이터베이스 행 및 페이지 본문(하이라이트 포함) 생성"""
+    """노션 데이터베이스 행 및 페이지 본문 생성 (Notion API 정규 포맷 준수)"""
     notion_url = "https://api.notion.com/v1/pages"
     headers = {
         "Authorization": f"Bearer {NOTION_TOKEN}",
@@ -170,12 +145,13 @@ def add_to_notion(title, url, category, summary, implication, highlights, stars,
         "Notion-Version": "2022-06-28"
     }
     
+    # 노션 API 규격에 맞게 rich_text에 "type": "text" 명시
     children_blocks = [
         {
             "object": "block",
             "type": "callout",
             "callout": {
-                "rich_text": [{"text": {"content": f"💡 AI 시사점\n{implication}"}}],
+                "rich_text": [{"type": "text", "text": {"content": f"💡 AI 시사점\n{implication}"}}],
                 "icon": {"emoji": "💡"},
                 "color": "yellow_background"
             }
@@ -183,21 +159,22 @@ def add_to_notion(title, url, category, summary, implication, highlights, stars,
         {
             "object": "block",
             "type": "heading_3",
-            "heading_3": {"rich_text": [{"text": {"content": "📌 핵심 하이라이트"}}]}
+            "heading_3": {"rich_text": [{"type": "text", "text": {"content": "📌 핵심 하이라이트"}}]}
         }
     ]
     
     for hl in highlights:
-        children_blocks.append({
-            "object": "block",
-            "type": "bulleted_list_item",
-            "bulleted_list_item": {"rich_text": [{"text": {"content": hl}}]}
-        })
+        if hl.strip():
+            children_blocks.append({
+                "object": "block",
+                "type": "bulleted_list_item",
+                "bulleted_list_item": {"rich_text": [{"type": "text", "text": {"content": hl}}]}
+            })
 
     children_blocks.extend([
         {"object": "block", "type": "divider", "divider": {}},
-        {"object": "block", "type": "heading_3", "heading_3": {"rich_text": [{"text": {"content": "📄 수집된 원문 내용"}}]}},
-        {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": article_content[:1500]}}]}}
+        {"object": "block", "type": "heading_3", "heading_3": {"rich_text": [{"type": "text", "text": {"content": "📄 수집된 원문 내용"}}]} },
+        {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"type": "text", "text": {"content": article_content[:1500]}}]}}
     ])
 
     payload = {
@@ -211,11 +188,16 @@ def add_to_notion(title, url, category, summary, implication, highlights, stars,
         },
         "children": children_blocks
     }
-    requests.post(notion_url, headers=headers, json=payload)
+    
+    res = requests.post(notion_url, headers=headers, json=payload)
+    if res.status_code == 200:
+        print(f"✅ 노션 등록 성공: {title[:25]}...", flush=True)
+    else:
+        print(f"❌ 노션 등록 실패 ({res.status_code}): {res.text}", flush=True)
 
 def main():
     if not ALPHA_API_KEY or not NOTION_TOKEN or not DATABASE_ID:
-        print("환경 변수(API_KEY, NOTION_TOKEN, DATABASE_ID) 설정을 확인하세요.")
+        print("환경 변수(ALPHA_API_KEY, NOTION_TOKEN, NOTION_PARENT_PAGE_ID) 설정을 확인하세요.", flush=True)
         return
 
     all_news = []
@@ -231,15 +213,16 @@ def main():
             })
 
     if not all_news:
-        print("수집된 뉴스가 없습니다.")
+        print("수집된 뉴스가 없습니다.", flush=True)
         return
 
     analysis_result = get_ai_analysis(all_news)
     if not analysis_result:
-        print("AI 분석 결과를 가져오지 못했습니다.")
+        print("AI 분석 결과를 가져오지 못했습니다.", flush=True)
         return
     
     articles = analysis_result.split("---ARTICLE---")
+    saved_count = 0
     for art in articles:
         if "번호:" not in art: continue
         try:
@@ -276,8 +259,11 @@ def main():
                     data.get("중요도", "★"),
                     orig['content']
                 )
+                saved_count += 1
         except Exception as e:
-            print(f"노션 저장 중 오류: {e}")
+            print(f"파싱/저장 중 오류: {e}", flush=True)
+
+    print(f"총 {saved_count}개 기사 처리 완료.", flush=True)
 
 if __name__ == "__main__":
     main()
