@@ -19,12 +19,11 @@ ALPHA_API_KEY = os.getenv("ALPHA_API_KEY")
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 DATABASE_ID = os.getenv("NOTION_PARENT_PAGE_ID")
 
-# 노션 허용 카테고리 (8개로 엄격 제한)
+# 노션 허용 카테고리 (8개 단일 키워드 고정)
 ALLOWED_CATEGORIES = [
     "해상", "항공", "육상", "철도", "창고", "글로벌 공급망", "친환경&기술", "규제&정책"
 ]
 
-# AI가 다른 단어를 출력하더라도 지정된 8개 카테고리로 자동 매핑
 CATEGORY_MAPPER = {
     "해운": "해상", "항만": "해상", "해운·항만": "해상", "해상": "해상",
     "항공": "항공", "항공·물류": "항공",
@@ -36,26 +35,20 @@ CATEGORY_MAPPER = {
     "규제&정책": "규제&정책", "규제·정책": "규제&정책", "정책·규제": "규제&정책"
 }
 
-# 우선순위별 RSS 수집 대상
-RSS_GROUPS = {
-    "group1": {  # 1순위: 해상/항공 (합산 최대 3개)
-        "해상": "https://news.google.com/rss/search?q=" + urllib.parse.quote("해운 항만 해상물류 -쇼핑"),
-        "항공": "https://news.google.com/rss/search?q=" + urllib.parse.quote("항공 화물 항공사 -쇼핑")
-    },
-    "group2": {  # 2순위: 육상/철도/창고
-        "육상": "https://news.google.com/rss/search?q=" + urllib.parse.quote("육상 운송 화물차 트럭"),
-        "철도": "https://news.google.com/rss/search?q=" + urllib.parse.quote("철도 물류 화물열차"),
-        "창고": "https://news.google.com/rss/search?q=" + urllib.parse.quote("물류창고 창고 풀필먼트")
-    },
-    "group3": {  # 3순위: 공급망/기술/정책
-        "글로벌 공급망": "https://news.google.com/rss/search?q=" + urllib.parse.quote("글로벌 공급망 리스크 수입 수출"),
-        "친환경&기술": "https://news.google.com/rss/search?q=" + urllib.parse.quote("친환경 물류 자율주행 로봇 스마트물류"),
-        "규제&정책": "https://news.google.com/rss/search?q=" + urllib.parse.quote("물류 정책 규제 국토부 관세청")
-    }
+# 8개 전 분야 후보 뉴스 RSS
+RSS_SOURCES = {
+    "해상": "https://news.google.com/rss/search?q=" + urllib.parse.quote("해운 항만 해상물류 -쇼핑"),
+    "항공": "https://news.google.com/rss/search?q=" + urllib.parse.quote("항공 화물 항공사 -쇼핑"),
+    "육상": "https://news.google.com/rss/search?q=" + urllib.parse.quote("육상 운송 화물차 트럭"),
+    "철도": "https://news.google.com/rss/search?q=" + urllib.parse.quote("철도 물류 화물열차"),
+    "창고": "https://news.google.com/rss/search?q=" + urllib.parse.quote("물류창고 풀필먼트 센터"),
+    "글로벌 공급망": "https://news.google.com/rss/search?q=" + urllib.parse.quote("글로벌 공급망 리스크 수입 수출"),
+    "친환경&기술": "https://news.google.com/rss/search?q=" + urllib.parse.quote("친환경 물류 자율주행 로봇 스마트물류"),
+    "규제&정책": "https://news.google.com/rss/search?q=" + urllib.parse.quote("물류 정책 규제 국토부 관세청")
 }
 
 def clean_title(title):
-    """기사 제목에서 별표 및 출처(- 언론사) 삭제하여 순수 제목만 추출"""
+    """제목 정제: 출처 및 별표 태그 삭제"""
     title = re.sub(r'\s*-\s*[^-]+$', '', title).strip()
     title = re.sub(r'^\[.*?\]\s*', '', title).strip()
     return title
@@ -103,69 +96,33 @@ def extract_article_details(entry):
 
     return real_url, article_text
 
-def collect_top_5_news():
-    """1순위(해상/항공) 최대 3개 + 2, 3순위 조합으로 정확히 5개 기사 수집"""
-    selected_news = []
-    
-    # 1. Group 1 (해상/항공): 최대 3개 수집
-    g1_items = []
-    for cat, url in RSS_GROUPS["group1"].items():
+def collect_candidate_news():
+    """전체 카테고리에서 AI 선별용 후보 뉴스 수집 (카테고리당 2개씩)"""
+    candidates = []
+    for cat, url in RSS_SOURCES.items():
         feed = feedparser.parse(url)
         for entry in feed.entries[:2]:
             real_url, content = extract_article_details(entry)
-            g1_items.append({
+            candidates.append({
                 "title": clean_title(entry.title),
                 "link": real_url,
                 "category": cat,
                 "content": content
             })
-    selected_news.extend(g1_items[:3])
-
-    # 2. Group 2 (육상/철도/창고) 수집
-    g2_items = []
-    for cat, url in RSS_GROUPS["group2"].items():
-        feed = feedparser.parse(url)
-        for entry in feed.entries[:2]:
-            real_url, content = extract_article_details(entry)
-            g2_items.append({
-                "title": clean_title(entry.title),
-                "link": real_url,
-                "category": cat,
-                "content": content
-            })
-
-    # 3. Group 3 (공급망/기술/정책) 수집
-    g3_items = []
-    for cat, url in RSS_GROUPS["group3"].items():
-        feed = feedparser.parse(url)
-        for entry in feed.entries[:2]:
-            real_url, content = extract_article_details(entry)
-            g3_items.append({
-                "title": clean_title(entry.title),
-                "link": real_url,
-                "category": cat,
-                "content": content
-            })
-
-    for item in g2_items + g3_items:
-        if len(selected_news) >= 5:
-            break
-        selected_news.append(item)
-
-    return selected_news[:5]
+    return candidates
 
 def sanitize_category(raw_cat):
-    """입력받은 분류명을 허용된 8개 카테고리 중 하나로 정리"""
+    """카테고리 규격 검증 및 8개 단일 키워드 매핑"""
     raw_cat = raw_cat.strip()
     if raw_cat in CATEGORY_MAPPER:
         return CATEGORY_MAPPER[raw_cat]
     for allowed in ALLOWED_CATEGORIES:
         if allowed in raw_cat or raw_cat in allowed:
             return allowed
-    return "글로벌 공급망"  # 기본값
+    return "글로벌 공급망"
 
-def get_ai_analysis(news_list):
-    """PwC Alpha AI를 사용하여 뉴스 분석 (지정 카테고리 및 명사형 어미 강제)"""
+def get_ai_analysis(candidates):
+    """AI가 해상(1~3개) 제한 조건 및 글로벌 공급망 영향도를 판단하여 5개 기사 선별 및 요약"""
     base_url = "https://workspace.kr.pwc.com/api/workspace/coding_agent/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {ALPHA_API_KEY}",
@@ -182,34 +139,37 @@ def get_ai_analysis(news_list):
     ]
 
     articles_payload = ""
-    for i, news in enumerate(news_list):
-        articles_payload += f"---기사 {i+1}---\n제목: {news['title']}\n본문: {news['content'][:800]}\n\n"
+    for i, news in enumerate(candidates):
+        articles_payload += f"---후보 기사 {i+1}---\n제목: {news['title']}\n기본분류: {news['category']}\n본문: {news['content'][:600]}\n\n"
 
     prompt = f"""
-당신은 물류/공급망 전문 분석가입니다. 다음 5개 기사를 분석하여 지침에 따라 작성하세요.
+당신은 물류/공급망 전문 분석가입니다. 제시된 후보 기사들 중 가장 중요한 ★정확히 5개 기사★를 선별하여 지정 양식으로 분석하세요.
 
-[기사 목록]
+[후보 기사 목록]
 {articles_payload}
 
-[작성 지침 - 엄격 준수]
-1. 분류: 반드시 다음 8개 중 가장 적합한 1개만 선택하세요. (다른 조합/복수 키워드 절대 금지!)
-   - 선택 가능 카테고리: [해상, 항공, 육상, 철도, 창고, 글로벌 공급망, 친환경&기술, 규제&정책]
-2. 요약: 기사 핵심 내용을 명사형 어미로 끝나는 ★단 1문장★으로 압축 작성하세요. (2문장 절대 금지)
-   - 어미 예시: ~함, ~음, ~임, ~확대, ~추진, ~전망, ~증가, ~지속 등
+[선별 지침]
+1. 전체 선별 수량: 정확히 5개 기사 선택.
+2. '해상' 카테고리 조건: 선별된 5개 기사 중 '해상' 관련 기사는 최소 1개 이상, 최대 3개 이하로 구성할 것.
+3. 나머지 기사 조건: 글로벌 공급망 및 물류 실무에 미치는 영향도가 높은 기사 순으로나머지 2~4개 기사를 채울 것.
+4. 평가 과정이나 판단 근거에 대한 문구는 일절 출력하지 말고, 결과 양식만 출력할 것.
+
+[작성 규칙]
+1. 분류: 반드시 다음 8개 단일 카테고리 중 1개 선택 [해상, 항공, 육상, 철도, 창고, 글로벌 공급망, 친환경&기술, 규제&정책]
+2. 요약: 기사 핵심 내용을 명사형 어미로 끝나는 ★단 1문장★으로 압축 작성할 것. (~함, ~음, ~임, ~확대, ~추진, ~전망, ~증가, ~지속 등)
 3. 시사점: 물류 실무 관점 영향 단 1문장 (개조식 명사형 어미 필수).
 4. 하이라이트: 핵심 요약 포인트 3개 (개조식 명사형 어미 필수).
 
 [응답 양식]
 ---ARTICLE---
-번호: (숫자)
-분류: (해상, 항공, 육상, 철도, 창고, 글로벌 공급망, 친환경&기술, 규제&정책 중 택1)
-요약: (명사형 어미로 끝나는 단 1문장 요약)
-시사점: (명사형 어미로 끝나는 1문장 시사점)
+후보번호: (숫자)
+분류: (8개 지정 카테고리 중 택1)
+요약: (명사형 어미 단 1문장)
+시사점: (명사형 어미 1문장)
 하이라이트:
 - (명사형 어미 포인트 1)
 - (명사형 어미 포인트 2)
 - (명사형 어미 포인트 3)
----END---
 """
 
     for model_name in models_to_try:
@@ -220,12 +180,12 @@ def get_ai_analysis(news_list):
         }
         
         try:
-            print(f"[{model_name}] 모델로 AI 분석 요청 중...", flush=True)
+            print(f"[{model_name}] 모델로 최적 5개 기사 선별 및 분석 요청 중...", flush=True)
             response = requests.post(base_url, headers=headers, json=payload, timeout=60)
             if response.status_code == 200:
                 result = response.json()
                 if 'choices' in result and len(result['choices']) > 0:
-                    print(f"SUCCESS: [{model_name}] 모델 AI 분석 완료!", flush=True)
+                    print(f"SUCCESS: [{model_name}] 모델 선별 및 분석 완료!", flush=True)
                     content = result['choices'][0]['message']['content']
                     content = re.sub(r'```[a-zA-Z]*', '', content).replace('```', '').strip()
                     return content
@@ -246,7 +206,7 @@ def add_to_notion(title, url, category, summary, implication, highlights, articl
     }
     
     pure_title = clean_title(title)
-    final_category = sanitize_category(category)  # 카테고리 검증 및 매핑
+    final_category = sanitize_category(category)
 
     children_blocks = [
         {
@@ -302,15 +262,15 @@ def main():
         print("환경 변수(ALPHA_API_KEY, NOTION_TOKEN, NOTION_PARENT_PAGE_ID) 설정을 확인하세요.", flush=True)
         return
 
-    all_news = collect_top_5_news()
-
-    if not all_news:
-        print("수집된 뉴스가 없습니다.", flush=True)
+    # 후보 뉴스 수집
+    candidates = collect_candidate_news()
+    if not candidates:
+        print("수집된 후보 뉴스가 없습니다.", flush=True)
         return
 
-    print(f"총 {len(all_news)}개 기사 수집 완료. AI 분석을 시작합니다.", flush=True)
+    print(f"총 {len(candidates)}개 후보 뉴스 수집 완료. 최적 5개 기사 선별을 시작합니다.", flush=True)
 
-    analysis_result = get_ai_analysis(all_news)
+    analysis_result = get_ai_analysis(candidates)
     if not analysis_result:
         print("AI 분석 결과를 가져오지 못했습니다.", flush=True)
         return
@@ -318,14 +278,14 @@ def main():
     articles = analysis_result.split("---ARTICLE---")
     saved_count = 0
     for art in articles:
-        if "번호:" not in art: continue
+        if "후보번호:" not in art: continue
         try:
             lines = [l.strip() for l in art.split("\n") if l.strip()]
             data = {"하이라이트": []}
             is_hl = False
             for line in lines:
-                if line.startswith("번호:"):
-                    data["번호"] = int(re.sub(r'[^0-9]', '', line))
+                if line.startswith("후보번호:"):
+                    data["후보번호"] = int(re.sub(r'[^0-9]', '', line))
                 elif line.startswith("분류:"):
                     data["분류"] = line.split(":", 1)[1].strip()
                 elif line.startswith("요약:"):
@@ -339,8 +299,8 @@ def main():
                 elif is_hl and line.startswith("-"):
                     data["하이라이트"].append(line.lstrip("- ").strip())
 
-            if "번호" in data and 1 <= data["번호"] <= len(all_news):
-                orig = all_news[data["번호"] - 1]
+            if "후보번호" in data and 1 <= data["후보번호"] <= len(candidates):
+                orig = candidates[data["후보번호"] - 1]
                 add_to_notion(
                     orig['title'],
                     orig['link'],
@@ -354,7 +314,7 @@ def main():
         except Exception as e:
             print(f"파싱/저장 중 오류: {e}", flush=True)
 
-    print(f"총 {saved_count}개 기사 처리 및 노션 저장 완료.", flush=True)
+    print(f"선별된 총 {saved_count}개 기사 처리 및 노션 저장 완료.", flush=True)
 
 if __name__ == "__main__":
     main()
