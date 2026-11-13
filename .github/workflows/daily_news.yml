@@ -2,9 +2,8 @@ name: Daily Logistics News Briefing
 
 on:
   schedule:
-    # 한국 시간 기준 매일 오전 06:00 실행 (UTC 기준 전날 21:00)
-    - cron: '0 21 * * *'
-  workflow_dispatch: # GitHub 웹사이트에서 버튼을 눌러 수동 실행도 가능
+    - cron: "30 14 * * *"   # UTC 14:30 = KST 23:30
+  workflow_dispatch:
 
 jobs:
   run-briefing:
