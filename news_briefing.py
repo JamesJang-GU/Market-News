@@ -33,7 +33,8 @@ FILL_MIN_IMPACT = 2        # 5건 미달 시 채움 기준 (해운 제외)
 SIMILARITY = 0.6           # 제목 유사도 임계값
 AI_SENT_LIMIT = 12         # AI에 전달할 기사당 문장 수
 BODY_MAX_CHARS = 6000
-NEWS_WINDOW = os.environ.get("NEWS_WINDOW", "2d")      # Google News 검색 기간 (1d/2d/7d)
+NEWS_WINDOW = os.environ.get("NEWS_WINDOW", "1d")      # Google News 검색 기간 (최근 24시간, 이후 당일 날짜로 재필터)
+ALLOW_UNKNOWN_DATE = os.environ.get("ALLOW_UNKNOWN_DATE", "0") == "1"  # 1이면 발행일 확인 불가 기사도 허용
 RECENT_DAYS = 7                                         # 이 기간 내 Notion 적재 기사와 중복 제외
 FORCE_RUN = os.environ.get("FORCE_RUN", "0") == "1"     # 1이면 오늘 이미 적재돼 있어도 실행
 BODY_FIRST = os.environ.get("BODY_FIRST", "1") == "1"   # 1이면 본문 확보 기사에 +3점 가산
@@ -57,7 +58,14 @@ HEADERS = {
 
 # ===== 유틸 =====
 def today_kst():
-    return datetime.datetime.now(KST).strftime("%Y-%m-%d")
+    """기준일(KST). 자정~02:00 사이 실행(GitHub cron 지연)은 전날로 간주. TARGET_DATE=YYYY-MM-DD로 강제 가능"""
+    override = os.environ.get("TARGET_DATE", "").strip()
+    if override:
+        return override
+    now = datetime.datetime.now(KST)
+    if now.hour < 2:
+        now -= datetime.timedelta(days=1)
+    return now.strftime("%Y-%m-%d")
 
 
 def clip(text, limit=1900):
@@ -84,6 +92,47 @@ def norm_title(t):
 def split_sentences(text):
     parts = re.split(r"(?<=[.!?])\s+", (text or "").strip())
     return [p.strip() for p in parts if p.strip()]
+
+
+# ===== 발행일 판정 =====
+LABEL_DATE_RE = re.compile(
+    r"(?:입력|등록|기사입력|발행|승인|작성)\s*[:：]?\s*(20\d{2})[.\-/년]\s*(\d{1,2})[.\-/월]\s*(\d{1,2})")
+
+
+def parse_date_str(v):
+    """ISO/일반 날짜 문자열 → KST 기준 YYYY-MM-DD (실패 시 '')"""
+    v = (v or "").strip()
+    try:
+        dt = datetime.datetime.fromisoformat(v.replace("Z", "+00:00"))
+        if dt.tzinfo:
+            dt = dt.astimezone(KST)
+        return dt.strftime("%Y-%m-%d")
+    except ValueError:
+        pass
+    m = re.search(r"(20\d{2})[-./](\d{1,2})[-./](\d{1,2})", v)
+    return f"{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}" if m else ""
+
+
+def extract_pub_date(soup, html):
+    """기사 발행일(KST). meta / JSON-LD / '입력·등록' 라벨 날짜만 사용. 불확실하면 ''"""
+    cands = []
+    for attr, val in [("property", "article:published_time"), ("property", "og:article:published_time"),
+                      ("name", "article:published_time"), ("name", "pubdate"), ("name", "date"),
+                      ("itemprop", "datePublished"), ("name", "DC.date.issued")]:
+        tag = soup.find("meta", attrs={attr: val})
+        if tag and tag.get("content"):
+            cands.append(tag["content"])
+    m = re.search(r'"datePublished"\s*:\s*"([^"]+)"', html or "")
+    if m:
+        cands.append(m.group(1))
+    for c in cands:
+        d = parse_date_str(c)
+        if d:
+            return d
+    m = LABEL_DATE_RE.search(soup.get_text(" ", strip=True))
+    if m:
+        return f"{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+    return ""
 
 
 # ===== 원문 수집 =====
@@ -162,17 +211,18 @@ def extract_lines(soup):
 
 
 def fetch_body(url):
-    """return (실제URL, 문단리스트[[문장…]…], 상태)"""
+    """return (실제URL, 문단리스트[[문장…]…], 상태, 발행일)"""
     real = resolve_url(url)
     if "news.google.com" in real:
-        return real, [], "google_unresolved"
+        return real, [], "google_unresolved", ""
     try:
         res = requests.get(real, headers=HEADERS, timeout=15)
         if res.status_code != 200:
-            return real, [], f"http_{res.status_code}"
+            return real, [], f"http_{res.status_code}", ""
         res.encoding = res.apparent_encoding
         soup = BeautifulSoup(res.text, "html.parser")
 
+        pub = extract_pub_date(soup, res.text)
         og = soup.find("meta", property="og:description") or soup.find("meta", attrs={"name": "description"})
         og_text = (og.get("content") or "").strip() if og else ""
 
@@ -187,12 +237,12 @@ def fetch_body(url):
                 paras.append(sents)
 
         if paras and sum(len(s) for p in paras for s in p) >= 200:
-            return real, paras, "ok"
+            return real, paras, "ok", pub
         if og_text and len(og_text) >= 30:       # 전문 실패 시 요약문이라도
-            return real, [split_sentences(og_text)], "partial"
-        return real, paras, "no_text" if not paras else "ok"
+            return real, [split_sentences(og_text)], "partial", pub
+        return real, paras, ("no_text" if not paras else "ok"), pub
     except Exception as e:
-        return real, [], f"err_{type(e).__name__}"
+        return real, [], f"err_{type(e).__name__}", ""
 
 
 # ===== 뉴스 수집 =====
@@ -226,14 +276,19 @@ def fetch_ksg_news(limit=6):
     return articles
 
 
-def fetch_google_news(query, count=5):
+def fetch_google_news(query, count=10):
     rss_url = (f"https://news.google.com/rss/search?q={urllib.parse.quote(query + f' when:{NEWS_WINDOW}')}"
                f"&hl=ko&gl=KR&ceid=KR:ko")
     articles = []
     try:
         feed = feedparser.parse(rss_url)
         for entry in feed.entries[:count]:
-            articles.append({"title": entry.title, "link": entry.link})
+            pub = ""
+            pp = getattr(entry, "published_parsed", None)
+            if pp:
+                pub = (datetime.datetime(*pp[:6], tzinfo=datetime.timezone.utc)
+                       .astimezone(KST).strftime("%Y-%m-%d"))
+            articles.append({"title": entry.title, "link": entry.link, "date": pub})
     except Exception as e:
         print(f"⚠️ Google RSS 실패 ({query[:10]}…): {e}")
     return articles
@@ -250,12 +305,16 @@ def fetch_all_news(recent_titles=(), recent_urls=()):
                 pool.append(s[i])
         i += 1
 
-    seen, unique, skipped = set(), [], 0
+    seen, unique, skipped, date_skipped = set(), [], 0, 0
+    today = today_kst()
     recent_norm = [norm_title(t) for t in recent_titles]
     for a in pool:
         nt = norm_title(a["title"])
         key = nt[:30]
         if key in seen:
+            continue
+        if a.get("date") and a["date"] != today:      # 당일 기사만
+            date_skipped += 1
             continue
         if a["link"] in recent_urls or any(
                 difflib.SequenceMatcher(None, nt, r).ratio() >= SIMILARITY for r in recent_norm):
@@ -263,18 +322,25 @@ def fetch_all_news(recent_titles=(), recent_urls=()):
             continue
         seen.add(key)
         unique.append(a)
-    print(f"   최근 {RECENT_DAYS}일 적재 기사와 중복 제외: {skipped}건")
+    print(f"   기준일 {today} 외 기사 제외: {date_skipped}건 / 최근 {RECENT_DAYS}일 적재 기사와 중복 제외: {skipped}건")
     unique = unique[:POOL_LIMIT]
 
     got = 0
     for n, a in enumerate(unique, 1):
-        a["link"], a["paras"], st = fetch_body(a["link"])
+        a["link"], a["paras"], st, pub = fetch_body(a["link"])
+        if not a.get("date"):
+            a["date"] = pub
         a["partial"] = (st == "partial")
         a["sents"] = [s for p in a["paras"] for s in p]
         got += 1 if a["sents"] else 0
-        print(f"   [{n:>2}] {st:<18} {len(a['sents']):>3}문장 | {a['link'][:70]}")
+        print(f"   [{n:>2}] {st:<18} {len(a['sents']):>3}문장 | {a['date'] or '날짜불명':<10} | {a['link'][:60]}")
     print(f"   본문 수집 {got}/{len(unique)}건")
-    return unique
+
+    kept = [a for a in unique if a["date"] == today or (not a["date"] and ALLOW_UNKNOWN_DATE)]
+    unknown = sum(1 for a in unique if not a["date"])
+    print(f"   당일({today}) 기사 {len(kept)}/{len(unique)}건 (발행일 불명 {unknown}건, "
+          f"{'포함' if ALLOW_UNKNOWN_DATE else '제외'})")
+    return kept
 
 
 # ===== AI 분석 =====
