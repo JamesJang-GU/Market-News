@@ -76,11 +76,12 @@ def get_ai_analysis(news_list):
         "Content-Type": "application/json"
     }
     
+    # 안정적이고 빠른 모델 우선 호출
     models_to_try = [
-        "Gemini_3.1_Pro",
-        "gemini-3.1-pro-preview",
         "Default",
         "gemini-3.7-flash",
+        "Gemini_3.1_Pro",
+        "gemini-3.1-pro-preview",
         "Processing",
         "Coding",
         "GPT_5.6_Sol"
@@ -120,13 +121,12 @@ def get_ai_analysis(news_list):
         
         try:
             print(f"[{model_name}] 모델로 AI 분석 시도 중...", flush=True)
-            response = requests.post(base_url, headers=headers, json=payload, timeout=30)
+            response = requests.post(base_url, headers=headers, json=payload, timeout=60)
             if response.status_code == 200:
                 result = response.json()
                 if 'choices' in result and len(result['choices']) > 0:
                     print(f"SUCCESS: [{model_name}] 모델로 AI 분석 성공!", flush=True)
                     content = result['choices'][0]['message']['content']
-                    # 마크다운 코드 블록 제거
                     content = re.sub(r'```[a-zA-Z]*', '', content).replace('```', '').strip()
                     return content
             
@@ -137,7 +137,7 @@ def get_ai_analysis(news_list):
     return None
 
 def add_to_notion(title, url, category, summary, implication, highlights, stars, article_content):
-    """노션 데이터베이스 행 및 페이지 본문 생성 (Notion API 정규 포맷 준수)"""
+    """노션 데이터베이스 행 및 페이지 본문 생성 (multi_select 대응)"""
     notion_url = "https://api.notion.com/v1/pages"
     headers = {
         "Authorization": f"Bearer {NOTION_TOKEN}",
@@ -145,7 +145,6 @@ def add_to_notion(title, url, category, summary, implication, highlights, stars,
         "Notion-Version": "2022-06-28"
     }
     
-    # 노션 API 규격에 맞게 rich_text에 "type": "text" 명시
     children_blocks = [
         {
             "object": "block",
@@ -182,7 +181,7 @@ def add_to_notion(title, url, category, summary, implication, highlights, stars,
         "properties": {
             "제목": {"title": [{"text": {"content": f"[{stars}] {title}"}}]},
             "날짜": {"date": {"start": datetime.now().strftime("%Y-%m-%d")}},
-            "분류": {"select": {"name": category}},
+            "분류": {"multi_select": [{"name": category}]},  # multi_select 형식으로 수정 완료
             "요약": {"rich_text": [{"text": {"content": summary}}]},
             "URL": {"url": url}
         },
