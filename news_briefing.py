@@ -7,6 +7,13 @@ import json
 import urllib.parse
 import re
 
+# 구글 뉴스 디코더 불러오기
+try:
+    from googlenewsdecoder import new_decoderv1
+    HAS_GND = True
+except ImportError:
+    HAS_GND = False
+
 # --- 설정 (Environment Variables) ---
 ALPHA_API_KEY = os.getenv("ALPHA_API_KEY")
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
@@ -18,8 +25,19 @@ RSS_URLS = {
     "종합·공급망": "https://news.google.com/rss/search?q=" + urllib.parse.quote("공급망 리스크 물류")
 }
 
+def decode_google_news_url(url):
+    """구글 뉴스 RSS 링크를 실제 언론사 원문 URL로 변환"""
+    if HAS_GND and "news.google.com" in url:
+        try:
+            decoded = new_decoderv1(url, interval=1)
+            if decoded and isinstance(decoded, dict) and decoded.get("decoded_url"):
+                return decoded["decoded_url"]
+        except Exception as e:
+            print(f"구글 URL 디코딩 오류: {e}")
+    return url
+
 def extract_article_details(entry):
-    """뉴스 원문 텍스트 수집"""
+    """뉴스 원문 URL 추적 및 본문 텍스트 수집"""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
@@ -27,13 +45,16 @@ def extract_article_details(entry):
     if hasattr(entry, 'summary'):
         rss_snippet = BeautifulSoup(entry.summary, 'html.parser').get_text().strip()
 
-    real_url = entry.link
+    # 1. 구글 뉴스 인코딩 해제
+    real_url = decode_google_news_url(entry.link)
     article_text = ""
+    
     try:
         res = requests.get(real_url, headers=headers, timeout=10, allow_redirects=True)
         res.encoding = res.apparent_encoding or 'utf-8'
         soup = BeautifulSoup(res.text, 'html.parser')
         
+        # 불필요한 태그 제거
         for tag in soup(["script", "style", "header", "footer", "nav", "aside", "form"]):
             tag.decompose()
             
@@ -41,40 +62,76 @@ def extract_article_details(entry):
         target = main_content if main_content else soup
         paragraphs = [p.get_text().strip() for p in target.find_all('p') if len(p.get_text().strip()) > 30]
         article_text = "\n".join(paragraphs)
-    except:
-        pass
+    except Exception as e:
+        print(f"원문 본문 크롤링 실패 ({real_url}): {e}")
 
-    if not article_text or len(article_text) < 100:
-        article_text = rss_snippet if rss_snippet else "원문 확인 필요"
+    if not article_text or len(article_text) < 50:
+        article_text = rss_snippet if rss_snippet else "원문 링크 참조 필요"
 
     return real_url, article_text
 
+def fetch_valid_models_from_api(base_url, headers):
+    """API의 /models 엔드포인트를 통해 활성화된 모델목록 자동 가져오기"""
+    try:
+        models_endpoint = base_url.replace("/chat/completions", "/models")
+        res = requests.get(models_endpoint, headers=headers, timeout=5)
+        if res.status_code == 200:
+            data = res.json()
+            if "data" in data and isinstance(data["data"], list):
+                return [item["id"] for item in data["data"] if "id" in item]
+    except Exception:
+        pass
+    return []
+
 def get_ai_analysis(news_list):
-    """PwC Alpha AI 모델을 사용하여 분석 (워크스페이스 확인 모델명 적용)"""
-    url = "https://workspace.kr.pwc.com/api/workspace/coding_agent/v1/chat/completions"
+    """PwC Alpha AI 모델을 이용하여 뉴스 요약/시사점/하이라이트 추출"""
+    base_url = "https://workspace.kr.pwc.com/api/workspace/coding_agent/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {ALPHA_API_KEY}",
         "Content-Type": "application/json"
     }
     
+    # 1. API 동적 모델 탐색
+    api_models = fetch_valid_models_from_api(base_url, headers)
+    
+    # 2. 대시보드 라벨 및 별칭 후보군
+    candidate_models = [
+        "Default",
+        "default",
+        "gemini-3.7-flash",
+        "Processing",
+        "gemini-3.1-flash-lite-preview",
+        "Coding",
+        "glm-5.3-flash",
+        "GPT_5.6_Sol",
+        "gpt-5.6-sol",
+        "Sonnet"
+    ]
+    
+    # 순서 유지 결합
+    models_to_try = []
+    for m in api_models + candidate_models:
+        if m not in models_to_try:
+            models_to_try.append(m)
+
     articles_payload = ""
     for i, news in enumerate(news_list):
         articles_payload += f"---기사 {i+1}---\n제목: {news['title']}\n본문: {news['content'][:800]}\n\n"
 
     prompt = f"""
-당신은 물류 전문가입니다. 다음 기사들을 분석하여 '요약', '시사점', '하이라이트'를 추출하세요.
+당신은 물류/공급망 전문가입니다. 다음 기사들을 분석하여 정확히 지침대로 출력하세요.
 
 [기사 목록]
 {articles_payload}
 
 [응답 양식]
-각 기사마다 반드시 아래 형식을 지키세요:
+각 기사마다 반드시 아래 형식을 엄수하세요:
 ---ARTICLE---
 번호: (숫자)
 분류: (해운·항만, 항공·물류, 친환경·기술, 정책·규제, 종합·공급망 중 택1)
 중요도: (★~★★★)
 요약: (기사 내용을 2문장으로 상세히 요약)
-시사점: (물류 실무에 주는 영향 1문장)
+시사점: (물류 실무자 관점 영향 1문장)
 하이라이트:
 - (핵심 요약 포인트 1)
 - (핵심 요약 포인트 2)
@@ -82,14 +139,6 @@ def get_ai_analysis(news_list):
 ---END---
 """
 
-    # 대시보드에서 확인된 실제 활성화 모델 식별자 목록
-    models_to_try = [
-        "vertex_ai.gemini-3.7-flash",
-        "bedrock.anthropic.claude-sonnet-4-6",
-        "openai.gpt-5.6-sol",
-        "bedrock.anthropic.claude-haiku-4-5"
-    ]
-    
     for model_name in models_to_try:
         payload = {
             "model": model_name,
@@ -99,11 +148,11 @@ def get_ai_analysis(news_list):
         
         try:
             print(f"[{model_name}] 모델로 AI 분석 시도 중...")
-            response = requests.post(url, headers=headers, json=payload)
+            response = requests.post(base_url, headers=headers, json=payload, timeout=30)
             if response.status_code == 200:
                 result = response.json()
                 if 'choices' in result and len(result['choices']) > 0:
-                    print(f"SUCCESS: [{model_name}] 모델 분석 완료!")
+                    print(f"SUCCESS: [{model_name}] 모델로 AI 분석 성공!")
                     return result['choices'][0]['message']['content']
             
             print(f"FAIL: [{model_name}] 응답 코드 {response.status_code} - {response.text}")
@@ -113,7 +162,7 @@ def get_ai_analysis(news_list):
     return None
 
 def add_to_notion(title, url, category, summary, implication, highlights, stars, article_content):
-    """노션 DB에 행 추가 및 본문 하이라이트 블록 생성"""
+    """노션 데이터베이스 행 및 페이지 본문(하이라이트 포함) 생성"""
     notion_url = "https://api.notion.com/v1/pages"
     headers = {
         "Authorization": f"Bearer {NOTION_TOKEN}",
@@ -147,7 +196,7 @@ def add_to_notion(title, url, category, summary, implication, highlights, stars,
 
     children_blocks.extend([
         {"object": "block", "type": "divider", "divider": {}},
-        {"object": "block", "type": "heading_3", "heading_3": {"rich_text": [{"text": {"content": "📄 수집된 본문내용"}}]}},
+        {"object": "block", "type": "heading_3", "heading_3": {"rich_text": [{"text": {"content": "📄 수집된 원문 내용"}}]}},
         {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": article_content[:1500]}}]}}
     ])
 
@@ -166,7 +215,7 @@ def add_to_notion(title, url, category, summary, implication, highlights, stars,
 
 def main():
     if not ALPHA_API_KEY or not NOTION_TOKEN or not DATABASE_ID:
-        print("환경 변수(API_KEY, NOTION_TOKEN, DATABASE_ID)를 확인하세요.")
+        print("환경 변수(API_KEY, NOTION_TOKEN, DATABASE_ID) 설정을 확인하세요.")
         return
 
     all_news = []
@@ -223,12 +272,12 @@ def main():
                     data.get("분류", "종합·공급망"),
                     data.get("요약", ""),
                     data.get("시사점", ""),
-                    data["하이라이트"] if data["하이라이트"] else ["본문 주요 내용 참조"],
+                    data["하이라이트"] if data["하이라이트"] else ["본문 내용 참조"],
                     data.get("중요도", "★"),
                     orig['content']
                 )
         except Exception as e:
-            print(f"처리 중 오류: {e}")
+            print(f"노션 저장 중 오류: {e}")
 
 if __name__ == "__main__":
     main()
