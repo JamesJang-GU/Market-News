@@ -1,11 +1,17 @@
 import os
 import re
 import sys
+import difflib
 import datetime
 import urllib.parse
 import requests
 import feedparser
 from bs4 import BeautifulSoup
+
+try:
+    from googlenewsdecoder import gnewsdecoder
+except ImportError:
+    gnewsdecoder = None
 
 # ===== 환경 변수 =====
 ALPHA_API_KEY = os.environ.get("ALPHA_API_KEY", "").strip()
@@ -17,26 +23,30 @@ ALPHA_URL = "https://workspace.kr.pwc.com/api/workspace/coding_agent/v1/chat/com
 NOTION_API_URL = "https://api.notion.com/v1/pages"
 
 # ===== 설정 =====
-DAILY_LIMIT = 5          # 하루 적재 건수
-POOL_LIMIT = 16          # AI 분석 후보 풀
+DAILY_LIMIT = 5            # 하루 적재 건수
+POOL_LIMIT = 15            # AI 분석 후보 풀
+SEA_MAX = 3                # 해운 절대 상한
+SEA_SOFT = 2               # 해운 기본 상한 (3번째는 영향도 5만 허용)
+MIN_IMPACT = {"해운": 4}   # 카테고리별 최소 영향도
+DEFAULT_MIN_IMPACT = 3
+FILL_MIN_IMPACT = 2        # 5건 미달 시 채움 기준 (해운 제외)
+SIMILARITY = 0.6           # 제목 유사도 임계값
+AI_SENT_LIMIT = 12         # AI에 전달할 기사당 문장 수
+BODY_MAX_CHARS = 6000
 DEFAULT_CATEGORY = "종합·공급망"
-
-# 카테고리 티어 (숫자 작을수록 선순위)
-CATEGORY_TIER = {
-    "해운": 1, "항공": 1,
-    "종합·공급망": 2,
-    "육상": 3, "철도": 3,
-    "창고·물류센터": 4,
-    "규제·정책": 5, "친환경·기술": 5,
-}
-ALLOWED_CATEGORIES = list(CATEGORY_TIER.keys())
+ALLOWED_CATEGORIES = ["해운", "항공", "육상", "철도", "창고·물류센터",
+                      "규제·정책", "친환경·기술", "종합·공급망"]
 
 GOOGLE_QUERIES = [
-    "해운 OR 항공화물 OR 컨테이너선 OR 선사 OR 운임",
-    "글로벌 공급망 OR 물동량 OR 홍해 OR 관세 물류 OR 국제물류",
+    "컨테이너선 OR 해운 운임 OR 선사 OR 항만 물동량",
+    "항공화물 OR 국제특송 OR 포워더 OR 항공 운임",
+    "물류센터 OR 창고 OR 풀필먼트 OR 3PL OR 라스트마일",
+    "글로벌 공급망 OR 관세 물류 OR 물류 규제 OR 수출입 물류",
 ]
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
 
+# ===== 유틸 =====
 def clip(text, limit=1900):
     text = text or ""
     return text if len(text) <= limit else text[:limit - 1] + "…"
@@ -48,20 +58,78 @@ def normalize_db_id(raw):
 
 
 def one_line(text, limit=110):
-    """첫 문장만 추출, 줄바꿈·마침표 제거 → 1줄 요약"""
     text = (text or "").replace("\n", " ").strip()
     text = re.split(r"(?<=[.。!?])\s", text)[0]
     text = text.strip().rstrip(".。 ")
     return text if len(text) <= limit else text[:limit - 1] + "…"
 
 
+def norm_title(t):
+    return re.sub(r"[^0-9A-Za-z가-힣]", "", t or "")
+
+
+def split_sentences(text):
+    parts = re.split(r"(?<=[.!?])\s+", (text or "").strip())
+    return [p.strip() for p in parts if p.strip()]
+
+
+# ===== 원문 수집 =====
+def resolve_url(url):
+    """구글 뉴스 리다이렉트 → 원문 URL"""
+    if "news.google.com" in url and gnewsdecoder:
+        try:
+            r = gnewsdecoder(url, interval=0.5)
+            if r.get("status") and r.get("decoded_url"):
+                return r["decoded_url"]
+        except Exception as e:
+            print(f"   ⚠️ URL 해제 실패: {type(e).__name__}")
+    return url
+
+
+def fetch_body(url):
+    """return (실제URL, [[문장,…], …]) / 실패 시 빈 리스트"""
+    real = resolve_url(url)
+    if "news.google.com" in real:
+        return real, []
+    try:
+        res = requests.get(real, headers=HEADERS, timeout=10)
+        res.encoding = res.apparent_encoding
+        if res.status_code != 200:
+            return real, []
+        soup = BeautifulSoup(res.text, "html.parser")
+        for t in soup(["script", "style", "nav", "footer", "aside", "header", "form"]):
+            t.decompose()
+        root = (soup.find("article")
+                or soup.find(id=re.compile("article|content|news", re.I))
+                or soup.body or soup)
+        texts = [p.get_text(" ", strip=True) for p in root.find_all("p")]
+        texts = [t for t in texts if len(t) >= 30]
+        if len(texts) < 2:
+            texts = [l.strip() for l in root.get_text("\n").split("\n") if len(l.strip()) >= 40]
+
+        paras, total, last = [], 0, None
+        for t in texts:
+            if t == last:
+                continue
+            last = t
+            total += len(t)
+            if total > BODY_MAX_CHARS:
+                break
+            sents = split_sentences(t)
+            if sents:
+                paras.append(sents)
+        return real, paras
+    except Exception as e:
+        print(f"   ⚠️ 본문 수집 실패: {type(e).__name__}")
+        return real, []
+
+
 # ===== 뉴스 수집 =====
 def fetch_ksg_news(limit=6):
     url = "https://ksg.co.kr/news/main_news.jsp"
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     articles = []
     try:
-        res = requests.get(url, headers=headers, timeout=10)
+        res = requests.get(url, headers=HEADERS, timeout=10)
         res.encoding = res.apparent_encoding
         print(f"   KSG status: {res.status_code}")
         if res.status_code == 200:
@@ -79,7 +147,7 @@ def fetch_ksg_news(limit=6):
                         full_url = f"https://ksg.co.kr/news/{href}"
                     if full_url not in seen:
                         seen.add(full_url)
-                        articles.append({"title": title, "link": full_url, "published": "최신 (KSG)"})
+                        articles.append({"title": title, "link": full_url})
                         if len(articles) >= limit:
                             break
     except Exception as e:
@@ -87,74 +155,94 @@ def fetch_ksg_news(limit=6):
     return articles
 
 
-def fetch_google_news(query, count=6):
+def fetch_google_news(query, count=5):
     rss_url = (f"https://news.google.com/rss/search?q={urllib.parse.quote(query)}"
                f"&hl=ko&gl=KR&ceid=KR:ko")
     articles = []
     try:
         feed = feedparser.parse(rss_url)
         for entry in feed.entries[:count]:
-            articles.append({
-                "title": entry.title,
-                "link": entry.link,
-                "published": getattr(entry, "published", "날짜 미상"),
-            })
+            articles.append({"title": entry.title, "link": entry.link})
     except Exception as e:
         print(f"⚠️ Google RSS 실패 ({query[:10]}…): {e}")
     return articles
 
 
 def fetch_all_news():
-    pool = fetch_ksg_news()
-    for q in GOOGLE_QUERIES:
-        pool += fetch_google_news(q)
+    sources = [fetch_ksg_news()] + [fetch_google_news(q) for q in GOOGLE_QUERIES]
 
-    # 제목 기준 중복 제거
+    # 소스별 라운드로빈 → 특정 소스 쏠림 방지
+    pool, i = [], 0
+    while any(i < len(s) for s in sources):
+        for s in sources:
+            if i < len(s):
+                pool.append(s[i])
+        i += 1
+
     seen, unique = set(), []
     for a in pool:
-        key = re.sub(r"\s+", "", a["title"])[:30]
+        key = norm_title(a["title"])[:30]
         if key not in seen:
             seen.add(key)
             unique.append(a)
-    return unique[:POOL_LIMIT]
+    unique = unique[:POOL_LIMIT]
+
+    got = 0
+    for a in unique:
+        a["link"], a["paras"] = fetch_body(a["link"])
+        a["sents"] = [s for p in a["paras"] for s in p]
+        got += 1 if a["sents"] else 0
+    print(f"   본문 수집 {got}/{len(unique)}건")
+    return unique
 
 
 # ===== AI 분석 =====
 def analyze_with_alpha_ai(articles):
     articles_text = ""
-    for idx, item in enumerate(articles, 1):
-        articles_text += f"[{idx}] 제목: {item['title']}\n링크: {item['link']}\n\n"
+    for idx, a in enumerate(articles, 1):
+        articles_text += f"[{idx}] 제목: {a['title']}\n"
+        sents = a["sents"][:AI_SENT_LIMIT]
+        if sents:
+            articles_text += "본문: " + " ".join(f"({n}) {clip(s, 200)}" for n, s in enumerate(sents, 1)) + "\n"
+        else:
+            articles_text += "본문: (수집 실패, 제목만으로 판단)\n"
+        articles_text += "\n"
 
     system_prompt = f"""
     당신은 국제물류·글로벌 공급망(SCM) 전문 리서치 분석가입니다.
-    제공된 뉴스 전체({len(articles)}개)를 빠짐없이 분류·평가해 주세요.
+    제공된 뉴스 전체({len(articles)}개)를 빠짐없이 평가해 주세요.
 
-    [카테고리 분류 지침]
-    아래 8개 중 가장 적합한 하나를 표기 그대로 선택합니다:
+    [카테고리] 아래 8개 중 하나를 표기 그대로 선택
     해운 / 항공 / 육상 / 철도 / 창고·물류센터 / 규제·정책 / 친환경·기술 / 종합·공급망
-    - 해운·항공 등 국제 운송, 글로벌 공급망 이슈는 해당 카테고리를 우선 적용합니다.
 
-    [중요도 판단 기준]
-    - 5점/4점: 국제 운임·항로·선복·항공 화물 이슈, 글로벌 공급망 차질, 대형 선사/화주 계약, 즉시 대응 필요 사안
-    - 3점/2점: 업계 동향, 중견 기업 실적, 신기술 도입
-    - 1점: 홍보성, 참고 수준 단신
+    [영향도 1~5] 기준 = 국내 화주·물류사의 비용, 리드타임, 운영, 계약에 미치는 실질 영향
+    - 5: 운임·선복·항로·관세·창고 수급 등 급변, 공급망 차질, 즉시 대응 필요
+    - 4: 중기적으로 비용·운영에 유의미한 영향이 전망되는 이슈
+    - 3: 참고할 업계 동향
+    - 2: 영향 제한적 (개별 기업 소식, 행사, 홍보성)
+    - 1: 영향 없음
+    - 해운 기사라도 선박 인도·명명식, 선사 홍보, 항만 행사, 지자체 사업 등 화주·물류사 영향이 없으면 1~2점.
+    - 창고·물류센터·기타 공급망 이슈도 화주·물류사에 큰 영향이 전망되면 4~5점 부여.
 
-    [작성 규칙 - 매우 중요]
-    - 요약: 반드시 1줄. 개조식. 어미는 명사형(~함, ~증가, ~확대, ~전망, ~필요 등). 마침표 금지.
-    - 시사점: 1줄. 개조식. 어미는 명사형. 마침표 금지.
-    - 서술형 어미(~합니다, ~했다, ~이다) 사용 금지.
-    - 마크다운 기호(**, # 등) 사용 금지.
-    - 각 기사에 원본 기사 번호를 번호: N 형식으로 명시.
-    - 실무 영향력이 큰 순서대로 순위 부여.
+    [중복그룹] 같은 사건·이슈를 다룬 기사는 같은 알파벳(A, B…)으로 묶음. 단독 기사는 '-'.
+
+    [작성 규칙]
+    - 요약: 반드시 1줄. 개조식. 어미는 명사형(~함, ~증가, ~확대, ~전망, ~필요). 마침표 금지.
+    - 시사점: 1~2줄. 화주·물류사 관점. 개조식. 명사형 어미. 마침표 금지.
+    - 서술형 어미(~합니다, ~했다, ~이다) 금지.
+    - 핵심문장: 본문 문장 번호 중 가장 중요한 1~3개를 쉼표로 나열. 본문이 없으면 '-'.
+    - 마크다운 기호(**, # 등) 금지.
+    - 모든 기사에 원본 기사 번호를 번호: N 형식으로 명시.
 
     [출력 형식 예시]
     ---ARTICLE_START---
     번호: 3
-    순위: 1
-    중요도: 5
-    카테고리: 해운
-    요약: 홍해 우회 장기화로 아시아-유럽 컨테이너 운임 15% 상승
-    시사점: 수출 화주 운송 리드타임 확대 및 선복 확보 비용 부담 증가
+    영향도: 5
+    카테고리: 창고·물류센터
+    중복그룹: -
+    요약: 수도권 냉동창고 공실률 1%대로 하락, 임대료 급등
+    시사점: 냉동·냉장 화주 보관 단가 인상 및 신규 계약 확보 난이도 상승 전망
+    핵심문장: 2, 5
     ---ARTICLE_END---
     """
 
@@ -166,9 +254,8 @@ def analyze_with_alpha_ai(articles):
             {"role": "user", "content": f"다음 뉴스들을 분석해 주세요:\n\n{articles_text}"},
         ],
     }
-
     try:
-        r = requests.post(ALPHA_URL, headers=headers, json=payload, timeout=(10, 180))
+        r = requests.post(ALPHA_URL, headers=headers, json=payload, timeout=(10, 240))
         print(f"   Alpha status: {r.status_code}")
         r.raise_for_status()
         return r.json()["choices"][0]["message"]["content"]
@@ -177,12 +264,12 @@ def analyze_with_alpha_ai(articles):
         return None
 
 
-# ===== AI 응답 파싱 + 우선순위 확정 =====
-KEYS = ["번호", "순위", "중요도", "카테고리", "요약", "시사점"]
+# ===== 파싱 =====
+KEYS = ["번호", "영향도", "카테고리", "중복그룹", "요약", "시사점", "핵심문장"]
 KEY_RE = re.compile(r"^[\s*#\-]*(" + "|".join(KEYS) + r")\s*\**\s*[:：]\s*\**\s*(.*)$")
 
 
-def parse_ai_analysis(ai_analysis, n_articles):
+def parse_ai_analysis(ai_analysis, articles):
     results = []
     for block in ai_analysis.split("---ARTICLE_START---")[1:]:
         block = block.split("---ARTICLE_END---")[0]
@@ -200,25 +287,29 @@ def parse_ai_analysis(ai_analysis, n_articles):
         if not num:
             continue
         idx = int(num.group()) - 1
-        if not (0 <= idx < n_articles):
+        if not (0 <= idx < len(articles)):
             continue
 
-        imp = re.search(r"[1-5]", parsed.get("중요도", ""))
-        rank = re.search(r"\d+", parsed.get("순위", ""))
+        imp = re.search(r"[1-5]", parsed.get("영향도", ""))
         category = parsed.get("카테고리", "").strip()
         if category not in ALLOWED_CATEGORIES:
             category = DEFAULT_CATEGORY
 
+        n_sent = min(len(articles[idx]["sents"]), AI_SENT_LIMIT)
+        hl = [int(x) for x in re.findall(r"\d+", parsed.get("핵심문장", ""))]
+        hl = sorted({h for h in hl if 1 <= h <= n_sent})[:3]
+
+        group = parsed.get("중복그룹", "-").strip()
         results.append({
             "idx": idx,
-            "rank": int(rank.group()) if rank else 99,
-            "importance": int(imp.group()) if imp else 3,
+            "impact": int(imp.group()) if imp else 3,
             "category": category,
+            "group": "" if group in ("", "-", "없음") else group,
             "summary": one_line(parsed.get("요약")) or "요약 정보 없음",
-            "insight": one_line(parsed.get("시사점")) or "시사점 정보 없음",
+            "insight": one_line(parsed.get("시사점"), 160) or "시사점 정보 없음",
+            "highlights": hl,
         })
 
-    # 중복 기사 번호 제거 (먼저 나온 것 유지)
     seen, dedup = set(), []
     for r in results:
         if r["idx"] not in seen:
@@ -227,19 +318,92 @@ def parse_ai_analysis(ai_analysis, n_articles):
     return dedup
 
 
-def prioritize(items, limit=DAILY_LIMIT):
-    """카테고리 티어(국제운송 우선) → 중요도 → AI 순위"""
-    ranked = sorted(
-        items,
-        key=lambda x: (CATEGORY_TIER.get(x["category"], 9), -x["importance"], x["rank"]),
-    )
-    return ranked[:limit]
+# ===== 우선순위 / 중복 / 해운 상한 =====
+def score(it):
+    return it["impact"] * 10 + (2 if it["category"] in ("해운", "항공") else 0)
 
 
-def fallback_items(articles, limit=DAILY_LIMIT):
-    return [{"idx": i, "rank": i + 1, "importance": 3, "category": DEFAULT_CATEGORY,
-             "summary": "AI 분석 미수행, 원문 링크 참조", "insight": "AI 분석 실패로 생략"}
-            for i in range(min(limit, len(articles)))]
+def is_dup(a, b, articles):
+    if a["group"] and a["group"] == b["group"]:
+        return True
+    ta = norm_title(articles[a["idx"]]["title"])
+    tb = norm_title(articles[b["idx"]]["title"])
+    return difflib.SequenceMatcher(None, ta, tb).ratio() >= SIMILARITY
+
+
+def prioritize(items, articles):
+    ranked = sorted(items, key=lambda x: (-score(x), x["idx"]))
+    chosen = []
+
+    def try_add(it, sea_cap):
+        if any(is_dup(it, c, articles) for c in chosen):
+            return False
+        sea = sum(1 for c in chosen if c["category"] == "해운")
+        if it["category"] == "해운" and sea >= sea_cap:
+            return False
+        chosen.append(it)
+        return True
+
+    # 1차: 최소 영향도 충족 기사 (해운 3번째는 영향도 5만)
+    for it in ranked:
+        if len(chosen) >= DAILY_LIMIT:
+            break
+        if it["impact"] < MIN_IMPACT.get(it["category"], DEFAULT_MIN_IMPACT):
+            continue
+        try_add(it, SEA_MAX if it["impact"] >= 5 else SEA_SOFT)
+
+    # 2차: 미달 시 해운 제외 영향도 2 이상으로 채움
+    if len(chosen) < DAILY_LIMIT:
+        for it in ranked:
+            if len(chosen) >= DAILY_LIMIT:
+                break
+            if it in chosen or it["category"] == "해운" or it["impact"] < FILL_MIN_IMPACT:
+                continue
+            try_add(it, SEA_SOFT)
+    return chosen
+
+
+def fallback_items(articles):
+    return [{"idx": i, "impact": 3, "category": DEFAULT_CATEGORY, "group": "",
+             "summary": "AI 분석 미수행, 원문 링크 참조", "insight": "AI 분석 실패로 생략",
+             "highlights": []}
+            for i in range(min(DAILY_LIMIT, len(articles)))]
+
+
+# ===== Notion 본문 구성 =====
+def build_children(it, art):
+    children = [
+        {"object": "block", "type": "callout",
+         "callout": {
+             "rich_text": [
+                 {"type": "text", "text": {"content": "AI 시사점\n"}, "annotations": {"bold": True}},
+                 {"type": "text", "text": {"content": clip(it["insight"])}},
+             ],
+             "icon": {"emoji": "💡"}, "color": "gray_background"}},
+        {"object": "block", "type": "divider", "divider": {}},
+        {"object": "block", "type": "heading_3",
+         "heading_3": {"rich_text": [{"type": "text", "text": {"content": "원문 기사"}}]}},
+    ]
+
+    if not art["paras"]:
+        children.append({"object": "block", "type": "paragraph", "paragraph": {"rich_text": [
+            {"type": "text", "text": {"content": "본문 자동 수집 실패. 상단 URL 속성의 링크에서 원문 확인 필요"}}]}})
+        return children
+
+    hl, n = set(it["highlights"]), 0
+    for para in art["paras"]:
+        rich = []
+        for s in para:
+            n += 1
+            obj = {"type": "text", "text": {"content": clip(s, 1900)}}
+            if n in hl:
+                obj["annotations"] = {"color": "yellow_background"}
+            rich.append(obj)
+            rich.append({"type": "text", "text": {"content": " "}})
+        for i in range(0, len(rich), 80):  # rich_text 100개 제한 대응
+            children.append({"object": "block", "type": "paragraph",
+                             "paragraph": {"rich_text": rich[i:i + 80]}})
+    return children[:95]  # children 100개 제한 대응
 
 
 # ===== Notion 적재 =====
@@ -255,8 +419,7 @@ def save_to_notion(articles, items):
 
     for it in items:
         art = articles[it["idx"]]
-        title_text = clip(art["title"], 200)  # 별 제거
-
+        title_text = clip(art["title"], 200)
         payload = {
             "parent": {"type": "database_id", "database_id": db_id},
             "properties": {
@@ -266,15 +429,8 @@ def save_to_notion(articles, items):
                 "요약": {"rich_text": [{"type": "text", "text": {"content": clip(it["summary"])}}]},
                 "URL": {"url": art["link"]},
             },
-            "children": [
-                {"object": "block", "type": "callout",
-                 "callout": {"rich_text": [{"type": "text", "text": {"content": "AI 시사점 분석"}}],
-                             "icon": {"emoji": "💡"}}},
-                {"object": "block", "type": "paragraph",
-                 "paragraph": {"rich_text": [{"type": "text", "text": {"content": clip(it["insight"])}}]}},
-            ],
+            "children": build_children(it, art),
         }
-
         try:
             res = requests.post(NOTION_API_URL, headers=headers, json=payload, timeout=30)
         except Exception as e:
@@ -284,7 +440,7 @@ def save_to_notion(articles, items):
 
         if res.status_code == 200:
             ok += 1
-            print(f"✅ [{it['category']}] {title_text}")
+            print(f"✅ [{it['category']}/영향도{it['impact']}] {title_text}")
         else:
             fail += 1
             print(f"❌ ({res.status_code}) {res.text[:500]}")
@@ -300,18 +456,19 @@ def main():
     if missing:
         sys.exit(f"❌ 환경변수 누락: {missing}")
 
-    print("1. 뉴스 수집 중...")
+    print("1. 뉴스·본문 수집 중...")
     articles = fetch_all_news()
-    print(f"   후보 {len(articles)}개 수집")
+    print(f"   후보 {len(articles)}개")
     if not articles:
         sys.exit("❌ 기사 0건")
 
     print("2. Alpha AI 분석 중...")
     ai_analysis = analyze_with_alpha_ai(articles)
-    items = parse_ai_analysis(ai_analysis, len(articles)) if ai_analysis else []
+    items = parse_ai_analysis(ai_analysis, articles) if ai_analysis else []
 
     if items:
-        items = prioritize(items)
+        print("   AI 평가: " + ", ".join(f"{i['idx']+1}:{i['category']}/{i['impact']}" for i in items))
+        items = prioritize(items, articles)
     elif FALLBACK_WITHOUT_AI:
         print("⚠️ AI 결과 없음 → 원문만 적재 (fallback)")
         items = fallback_items(articles)
