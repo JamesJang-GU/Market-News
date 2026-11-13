@@ -3,6 +3,7 @@ import re
 import datetime
 import requests
 import feedparser
+from urllib.parse import quote         
 from bs4 import BeautifulSoup
 
 # 1. 환경 변수 불러오기 (GitHub Secrets)
