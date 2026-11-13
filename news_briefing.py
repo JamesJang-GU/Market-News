@@ -19,11 +19,28 @@ ALPHA_API_KEY = os.getenv("ALPHA_API_KEY")
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 DATABASE_ID = os.getenv("NOTION_PARENT_PAGE_ID")
 
-RSS_URLS = {
-    "해운·항만": "https://news.google.com/rss/search?q=" + urllib.parse.quote("해운 항만 물류 -쇼핑"),
-    "항공·물류": "https://news.google.com/rss/search?q=" + urllib.parse.quote("항공 화물 물류"),
-    "종합·공급망": "https://news.google.com/rss/search?q=" + urllib.parse.quote("공급망 리스크 물류")
+# 우선순위별 RSS 카테고리 구성
+RSS_GROUPS = {
+    "group1": {  # 1순위: 해상/항공 (최대 3개)
+        "해운·항만": "https://news.google.com/rss/search?q=" + urllib.parse.quote("해운 항만 물류 -쇼핑"),
+        "항공·물류": "https://news.google.com/rss/search?q=" + urllib.parse.quote("항공 화물 물류")
+    },
+    "group2": {  # 2순위: 창고/육상
+        "육상·창고": "https://news.google.com/rss/search?q=" + urllib.parse.quote("육상 운송 창고 풀필먼트 물류")
+    },
+    "group3": {  # 3순위: 친환경/기술/정책
+        "친환경·기술": "https://news.google.com/rss/search?q=" + urllib.parse.quote("친환경 물류 기술 자동화"),
+        "정책·규제": "https://news.google.com/rss/search?q=" + urllib.parse.quote("물류 정책 규제 국토부")
+    }
 }
+
+def clean_title(title):
+    """기사 제목에서 별표 및 출처(- 언론사) 삭제하여 순수 제목만 추출"""
+    # 1. 제목 끝의 "- 언론사명" 제거
+    title = re.sub(r'\s*-\s*[^-]+$', '', title).strip()
+    # 2. 앞쪽의 대괄호 태그 [★], [속보] 등 제거
+    title = re.sub(r'^\[.*?\]\s*', '', title).strip()
+    return title
 
 def decode_google_news_url(url):
     """구글 뉴스 RSS 링크를 실제 언론사 원문 URL로 변환"""
@@ -61,27 +78,77 @@ def extract_article_details(entry):
         paragraphs = [p.get_text().strip() for p in target.find_all('p') if len(p.get_text().strip()) > 30]
         article_text = "\n".join(paragraphs)
     except Exception as e:
-        print(f"원문 본문 크롤링 실패 ({real_url}): {e}", flush=True)
+        print(f"원문 크롤링 참고 ({real_url}): {e}", flush=True)
 
     if not article_text or len(article_text) < 50:
         article_text = rss_snippet if rss_snippet else "원문 링크 참조 필요"
 
     return real_url, article_text
 
+def collect_top_5_news():
+    """1순위(해상/항공) 최대 3개 + 2, 3순위 조합으로 정확히 5개 기사 수집"""
+    selected_news = []
+    
+    # 1. Group 1 (해상/항공): 최대 3개 수집
+    g1_items = []
+    for cat, url in RSS_GROUPS["group1"].items():
+        feed = feedparser.parse(url)
+        for entry in feed.entries[:2]:
+            real_url, content = extract_article_details(entry)
+            g1_items.append({
+                "title": clean_title(entry.title),
+                "link": real_url,
+                "category": cat,
+                "content": content
+            })
+    selected_news.extend(g1_items[:3]) # 최대 3개 제한
+
+    # 2. Group 2 (창고/육상) 수집
+    g2_items = []
+    for cat, url in RSS_GROUPS["group2"].items():
+        feed = feedparser.parse(url)
+        for entry in feed.entries[:2]:
+            real_url, content = extract_article_details(entry)
+            g2_items.append({
+                "title": clean_title(entry.title),
+                "link": real_url,
+                "category": cat,
+                "content": content
+            })
+
+    # 3. Group 3 (친환경/기술/정책) 수집
+    g3_items = []
+    for cat, url in RSS_GROUPS["group3"].items():
+        feed = feedparser.parse(url)
+        for entry in feed.entries[:2]:
+            real_url, content = extract_article_details(entry)
+            g3_items.append({
+                "title": clean_title(entry.title),
+                "link": real_url,
+                "category": cat,
+                "content": content
+            })
+
+    # 남은 자리를 Group 2와 Group 3 순서대로 채워 총 5개 맞춤
+    for item in g2_items + g3_items:
+        if len(selected_news) >= 5:
+            break
+        selected_news.append(item)
+
+    return selected_news[:5]
+
 def get_ai_analysis(news_list):
-    """PwC Alpha AI 모델을 이용하여 뉴스 요약/시사점/하이라이트 추출"""
+    """PwC Alpha AI를 사용하여 개조식/명사형 어미 요약 및 분석"""
     base_url = "https://workspace.kr.pwc.com/api/workspace/coding_agent/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {ALPHA_API_KEY}",
         "Content-Type": "application/json"
     }
     
-    # 안정적이고 빠른 모델 우선 호출
     models_to_try = [
         "Default",
         "gemini-3.7-flash",
         "Gemini_3.1_Pro",
-        "gemini-3.1-pro-preview",
         "Processing",
         "Coding",
         "GPT_5.6_Sol"
@@ -92,23 +159,28 @@ def get_ai_analysis(news_list):
         articles_payload += f"---기사 {i+1}---\n제목: {news['title']}\n본문: {news['content'][:800]}\n\n"
 
     prompt = f"""
-당신은 물류/공급망 전문가입니다. 다음 기사들을 분석하여 정확히 지침대로 출력하세요.
+당신은 물류/공급망 전문 분석가입니다. 다음 5개 기사를 분석하여 지침에 따라 작성을 완료하세요.
 
 [기사 목록]
 {articles_payload}
 
+[작성 지침]
+1. 요약: 기사의 핵심 내용을 1~2줄의 개조식 문장으로 작성하세요.
+   ★ 중요: 모든 문장의 어미는 반드시 명사형(~함, ~음, ~임, ~확대, ~추진, ~전망, ~증가 등)으로 마칠 것!
+2. 시사점: 물류 실무 관점의 영향 1문장 (개조식 명사형 어미 필수).
+3. 하이라이트: 핵심 요약 포인트 3개 (개조식 명사형 어미 필수).
+
 [응답 양식]
-각 기사마다 반드시 아래 형식을 엄수하세요:
+각 기사마다 아래 형식을 완벽히 지키세요:
 ---ARTICLE---
 번호: (숫자)
-분류: (해운·항만, 항공·물류, 친환경·기술, 정책·규제, 종합·공급망 중 택1)
-중요도: (★~★★★)
-요약: (기사 내용을 2문장으로 상세히 요약)
-시사점: (물류 실무자 관점 영향 1문장)
+분류: (해운·항만, 항공·물류, 육상·창고, 친환경·기술, 정책·규제 중 택1)
+요약: (명사형 어미로 끝나는 1~2줄 개조식 요약)
+시사점: (명사형 어미로 끝나는 1문장 시사점)
 하이라이트:
-- (핵심 요약 포인트 1)
-- (핵심 요약 포인트 2)
-- (핵심 요약 포인트 3)
+- (명사형 어미 포인트 1)
+- (명사형 어미 포인트 2)
+- (명사형 어미 포인트 3)
 ---END---
 """
 
@@ -116,16 +188,16 @@ def get_ai_analysis(news_list):
         payload = {
             "model": model_name,
             "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.3
+            "temperature": 0.2
         }
         
         try:
-            print(f"[{model_name}] 모델로 AI 분석 시도 중...", flush=True)
+            print(f"[{model_name}] 모델로 AI 분석 요청 중...", flush=True)
             response = requests.post(base_url, headers=headers, json=payload, timeout=60)
             if response.status_code == 200:
                 result = response.json()
                 if 'choices' in result and len(result['choices']) > 0:
-                    print(f"SUCCESS: [{model_name}] 모델로 AI 분석 성공!", flush=True)
+                    print(f"SUCCESS: [{model_name}] 모델 AI 분석 완료!", flush=True)
                     content = result['choices'][0]['message']['content']
                     content = re.sub(r'```[a-zA-Z]*', '', content).replace('```', '').strip()
                     return content
@@ -136,8 +208,8 @@ def get_ai_analysis(news_list):
 
     return None
 
-def add_to_notion(title, url, category, summary, implication, highlights, stars, article_content):
-    """노션 데이터베이스 행 및 페이지 본문 생성 (multi_select 대응)"""
+def add_to_notion(title, url, category, summary, implication, highlights, article_content):
+    """노션 DB 행 및 본문 등록 (별표 제거된 순수 제목 사용)"""
     notion_url = "https://api.notion.com/v1/pages"
     headers = {
         "Authorization": f"Bearer {NOTION_TOKEN}",
@@ -145,6 +217,9 @@ def add_to_notion(title, url, category, summary, implication, highlights, stars,
         "Notion-Version": "2022-06-28"
     }
     
+    # 순수한 기사 제목 사용
+    pure_title = clean_title(title)
+
     children_blocks = [
         {
             "object": "block",
@@ -179,9 +254,9 @@ def add_to_notion(title, url, category, summary, implication, highlights, stars,
     payload = {
         "parent": {"database_id": DATABASE_ID},
         "properties": {
-            "제목": {"title": [{"text": {"content": f"[{stars}] {title}"}}]},
+            "제목": {"title": [{"text": {"content": pure_title}}]},
             "날짜": {"date": {"start": datetime.now().strftime("%Y-%m-%d")}},
-            "분류": {"multi_select": [{"name": category}]},  # multi_select 형식으로 수정 완료
+            "분류": {"multi_select": [{"name": category}]},
             "요약": {"rich_text": [{"text": {"content": summary}}]},
             "URL": {"url": url}
         },
@@ -190,7 +265,7 @@ def add_to_notion(title, url, category, summary, implication, highlights, stars,
     
     res = requests.post(notion_url, headers=headers, json=payload)
     if res.status_code == 200:
-        print(f"✅ 노션 등록 성공: {title[:25]}...", flush=True)
+        print(f"✅ 노션 등록 성공: {pure_title[:30]}...", flush=True)
     else:
         print(f"❌ 노션 등록 실패 ({res.status_code}): {res.text}", flush=True)
 
@@ -199,21 +274,14 @@ def main():
         print("환경 변수(ALPHA_API_KEY, NOTION_TOKEN, NOTION_PARENT_PAGE_ID) 설정을 확인하세요.", flush=True)
         return
 
-    all_news = []
-    for category, rss_url in RSS_URLS.items():
-        feed = feedparser.parse(rss_url)
-        for entry in feed.entries[:3]:
-            real_url, content = extract_article_details(entry)
-            all_news.append({
-                "title": entry.title,
-                "link": real_url,
-                "category": category,
-                "content": content
-            })
+    # 지침에 따른 5개 뉴스 수집 (해상/항공 3개 제한 및 2,3순위 구성)
+    all_news = collect_top_5_news()
 
     if not all_news:
         print("수집된 뉴스가 없습니다.", flush=True)
         return
+
+    print(f"총 {len(all_news)}개 기사 수집 완료 (해상/항공 최대 3개 제한 적용). AI 분석을 시작합니다.", flush=True)
 
     analysis_result = get_ai_analysis(all_news)
     if not analysis_result:
@@ -233,8 +301,6 @@ def main():
                     data["번호"] = int(re.sub(r'[^0-9]', '', line))
                 elif line.startswith("분류:"):
                     data["분류"] = line.split(":", 1)[1].strip()
-                elif line.startswith("중요도:"):
-                    data["중요도"] = line.split(":", 1)[1].strip()
                 elif line.startswith("요약:"):
                     data["요약"] = line.split(":", 1)[1].strip()
                     is_hl = False
@@ -251,18 +317,17 @@ def main():
                 add_to_notion(
                     orig['title'],
                     orig['link'],
-                    data.get("분류", "종합·공급망"),
+                    data.get("분류", orig['category']),
                     data.get("요약", ""),
                     data.get("시사점", ""),
                     data["하이라이트"] if data["하이라이트"] else ["본문 내용 참조"],
-                    data.get("중요도", "★"),
                     orig['content']
                 )
                 saved_count += 1
         except Exception as e:
             print(f"파싱/저장 중 오류: {e}", flush=True)
 
-    print(f"총 {saved_count}개 기사 처리 완료.", flush=True)
+    print(f"총 {saved_count}개 기사 처리 및 노션 저장 완료.", flush=True)
 
 if __name__ == "__main__":
     main()
