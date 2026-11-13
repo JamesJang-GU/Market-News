@@ -19,7 +19,10 @@ RSS_URLS = {
 }
 
 def extract_article_details(entry):
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+    """뉴스 원문 텍스트 수집"""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
     rss_snippet = ""
     if hasattr(entry, 'summary'):
         rss_snippet = BeautifulSoup(entry.summary, 'html.parser').get_text().strip()
@@ -47,10 +50,13 @@ def extract_article_details(entry):
     return real_url, article_text
 
 def get_ai_analysis(news_list):
+    """PwC Alpha AI를 사용하여 요약, 시사점, 하이라이트 분석 (모델 폴백 지원)"""
     url = "https://workspace.kr.pwc.com/api/workspace/coding_agent/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {ALPHA_API_KEY}", "Content-Type": "application/json"}
+    headers = {
+        "Authorization": f"Bearer {ALPHA_API_KEY}",
+        "Content-Type": "application/json"
+    }
     
-    # 입력 데이터가 너무 크면 API 오류가 발생하므로 800자로 제한
     articles_payload = ""
     for i, news in enumerate(news_list):
         articles_payload += f"---기사 {i+1}---\n제목: {news['title']}\n본문: {news['content'][:800]}\n\n"
@@ -76,36 +82,62 @@ def get_ai_analysis(news_list):
 ---END---
 """
 
-    payload = {
-        "model": "gpt-4o",
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.3
-    }
+    # 시도할 모델 목록 (PwC Alpha API 지원 모델 순차 탐색)
+    models_to_try = ["gpt-4o-mini", "gpt-4-turbo", "gpt-4", "gpt-3.5-turbo"]
     
-    response = requests.post(url, headers=headers, json=payload)
-    
-    # 에러 핸들링 강화
-    if response.status_code != 200:
-        print(f"API Error: {response.status_code} - {response.text}")
-        return None
+    for model_name in models_to_try:
+        payload = {
+            "model": model_name,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.3
+        }
+        
+        try:
+            response = requests.post(url, headers=headers, json=payload)
+            if response.status_code == 200:
+                result = response.json()
+                if 'choices' in result and len(result['choices']) > 0:
+                    print(f"성공: [{model_name}] 모델로 분석 완료")
+                    return result['choices'][0]['message']['content']
+            
+            print(f"모델 [{model_name}] 응답 실패: {response.status_code} - {response.text}")
+        except Exception as e:
+            print(f"모델 [{model_name}] 요청 중 예외 발생: {e}")
 
-    result = response.json()
-    if 'choices' not in result:
-        print(f"Unexpected Response Format: {result}")
-        return None
-
-    return result['choices'][0]['message']['content']
+    return None
 
 def add_to_notion(title, url, category, summary, implication, highlights, stars, article_content):
+    """노션 DB에 행 추가"""
     notion_url = "https://api.notion.com/v1/pages"
-    headers = {"Authorization": f"Bearer {NOTION_TOKEN}", "Content-Type": "application/json", "Notion-Version": "2022-06-28"}
+    headers = {
+        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Content-Type": "application/json",
+        "Notion-Version": "2022-06-28"
+    }
     
     children_blocks = [
-        {"object": "block", "type": "callout", "callout": {"rich_text": [{"text": {"content": f"💡 AI 시사점\n{implication}"}}], "icon": {"emoji": "💡"}, "color": "blue_background"}},
-        {"object": "block", "type": "heading_3", "heading_3": {"rich_text": [{"text": {"content": "📌 핵심 하이라이트"}}]}}
+        {
+            "object": "block",
+            "type": "callout",
+            "callout": {
+                "rich_text": [{"text": {"content": f"💡 AI 시사점\n{implication}"}}],
+                "icon": {"emoji": "💡"},
+                "color": "yellow_background"
+            }
+        },
+        {
+            "object": "block",
+            "type": "heading_3",
+            "heading_3": {"rich_text": [{"text": {"content": "📌 핵심 하이라이트"}}]}
+        }
     ]
+    
     for hl in highlights:
-        children_blocks.append({"object": "block", "type": "bulleted_list_item", "bulleted_list_item": {"rich_text": [{"text": {"content": hl}}]}})
+        children_blocks.append({
+            "object": "block",
+            "type": "bulleted_list_item",
+            "bulleted_list_item": {"rich_text": [{"text": {"content": hl}}]}
+        })
 
     children_blocks.extend([
         {"object": "block", "type": "divider", "divider": {}},
@@ -127,8 +159,8 @@ def add_to_notion(title, url, category, summary, implication, highlights, stars,
     requests.post(notion_url, headers=headers, json=payload)
 
 def main():
-    if not ALPHA_API_KEY or not NOTION_TOKEN:
-        print("API 토큰 설정이 누락되었습니다.")
+    if not ALPHA_API_KEY or not NOTION_TOKEN or not DATABASE_ID:
+        print("필수 환경 변수(API_KEY, NOTION_TOKEN, DATABASE_ID)가 설정되지 않았습니다.")
         return
 
     all_news = []
@@ -136,7 +168,12 @@ def main():
         feed = feedparser.parse(rss_url)
         for entry in feed.entries[:3]:
             real_url, content = extract_article_details(entry)
-            all_news.append({"title": entry.title, "link": real_url, "category": category, "content": content})
+            all_news.append({
+                "title": entry.title,
+                "link": real_url,
+                "category": category,
+                "content": content
+            })
 
     if not all_news:
         print("수집된 뉴스가 없습니다.")
@@ -144,7 +181,7 @@ def main():
 
     analysis_result = get_ai_analysis(all_news)
     if not analysis_result:
-        print("AI 분석 결과를 가져오지 못했습니다.")
+        print("AI 분석 결과를 가져오지 못했습니다. API 키 또는 모델 권한을 확인하세요.")
         return
     
     articles = analysis_result.split("---ARTICLE---")
@@ -155,16 +192,35 @@ def main():
             data = {"하이라이트": []}
             is_hl = False
             for line in lines:
-                if line.startswith("번호:"): data["번호"] = int(re.sub(r'[^0-9]', '', line))
-                elif line.startswith("분류:"): data["분류"] = line.split(":", 1)[1].strip()
-                elif line.startswith("중요도:"): data["중요도"] = line.split(":", 1)[1].strip()
-                elif line.startswith("요약:"): data["요약"] = line.split(":", 1)[1].strip(); is_hl = False
-                elif line.startswith("시사점:"): data["시사점"] = line.split(":", 1)[1].strip(); is_hl = False
-                elif line.startswith("하이라이트:"): is_hl = True
-                elif is_hl and line.startswith("-"): data["하이라이트"].append(line.lstrip("- ").strip())
+                if line.startswith("번호:"):
+                    data["번호"] = int(re.sub(r'[^0-9]', '', line))
+                elif line.startswith("분류:"):
+                    data["분류"] = line.split(":", 1)[1].strip()
+                elif line.startswith("중요도:"):
+                    data["중요도"] = line.split(":", 1)[1].strip()
+                elif line.startswith("요약:"):
+                    data["요약"] = line.split(":", 1)[1].strip()
+                    is_hl = False
+                elif line.startswith("시사점:"):
+                    data["시사점"] = line.split(":", 1)[1].strip()
+                    is_hl = False
+                elif line.startswith("하이라이트:"):
+                    is_hl = True
+                elif is_hl and line.startswith("-"):
+                    data["하이라이트"].append(line.lstrip("- ").strip())
 
-            orig = all_news[data["번호"] - 1]
-            add_to_notion(orig['title'], orig['link'], data.get("분류", "종합·공급망"), data.get("요약", ""), data.get("시사점", ""), data["하이라이트"], data.get("중요도", "★"), orig['content'])
+            if "번호" in data and 1 <= data["번호"] <= len(all_news):
+                orig = all_news[data["번호"] - 1]
+                add_to_notion(
+                    orig['title'],
+                    orig['link'],
+                    data.get("분류", "종합·공급망"),
+                    data.get("요약", ""),
+                    data.get("시사점", ""),
+                    data["하이라이트"] if data["하이라이트"] else ["핵심 내용 본문 참조"],
+                    data.get("중요도", "★"),
+                    orig['content']
+                )
         except Exception as e:
             print(f"처리 중 오류: {e}")
 
