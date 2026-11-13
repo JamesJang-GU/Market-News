@@ -43,7 +43,11 @@ GOOGLE_QUERIES = [
     "물류센터 OR 창고 OR 풀필먼트 OR 3PL OR 라스트마일",
     "글로벌 공급망 OR 관세 물류 OR 물류 규제 OR 수출입 물류",
 ]
-HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml",
+    "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.5",
+}
 
 
 # ===== 유틸 =====
@@ -74,54 +78,106 @@ def split_sentences(text):
 
 
 # ===== 원문 수집 =====
+NOISE_RE = re.compile(
+    r"(저작권|무단\s*전재|재배포|구독|Copyright|©|광고문의|관련기사|댓글|공유하기|좋아요|기사제보|@[\w.-]+\.[a-z]{2,})",
+    re.I)
+BODY_HINT = re.compile(r"(article|content|news|view|body|text|detail|cont)", re.I)
+
+
 def resolve_url(url):
-    """구글 뉴스 리다이렉트 → 원문 URL"""
-    if "news.google.com" in url and gnewsdecoder:
+    """구글 뉴스 리다이렉트 → 원문 URL (2회 재시도)"""
+    if "news.google.com" not in url:
+        return url
+    if not gnewsdecoder:
+        print("   ⚠️ googlenewsdecoder 미설치 (requirements.txt 확인)")
+        return url
+    for _ in range(2):
         try:
-            r = gnewsdecoder(url, interval=0.5)
+            r = gnewsdecoder(url, interval=1)
             if r.get("status") and r.get("decoded_url"):
                 return r["decoded_url"]
+            print(f"   ⚠️ URL 해제 실패: {str(r.get('message'))[:80]}")
         except Exception as e:
-            print(f"   ⚠️ URL 해제 실패: {type(e).__name__}")
+            print(f"   ⚠️ URL 해제 예외: {type(e).__name__}: {str(e)[:80]}")
     return url
 
 
+def _lines_of(node):
+    out, seen = [], set()
+    for l in node.get_text("\n").split("\n"):
+        l = re.sub(r"\s+", " ", l).strip()
+        if len(l) < 25 or l in seen:
+            continue
+        if NOISE_RE.search(l) and len(l) < 100:
+            continue
+        seen.add(l)
+        out.append(l)
+    return out
+
+
+def extract_lines(soup):
+    """본문 후보 컨테이너 중 (텍스트량 × 링크 비율 보정) 최고 점수 선택"""
+    for t in soup(["script", "style", "nav", "footer", "aside", "header", "form", "iframe", "noscript"]):
+        t.decompose()
+    for br in soup.find_all("br"):
+        br.replace_with("\n")
+
+    cands = []
+    art = soup.find("article")
+    if art:
+        cands.append(art)
+    cands += soup.find_all(["div", "section"], id=BODY_HINT)
+    cands += soup.find_all(["div", "section"], class_=BODY_HINT)
+
+    best, best_score = [], 0
+    for c in cands:
+        ls = _lines_of(c)
+        total = sum(len(l) for l in ls)
+        link_len = sum(len(a.get_text(strip=True)) for a in c.find_all("a"))
+        density = link_len / max(len(c.get_text(strip=True)), 1)
+        score = total * (1 - density)
+        if score > best_score:
+            best, best_score = ls, score
+
+    if sum(len(l) for l in best) < 300:          # 후보 부실 시 body 전체
+        body_ls = _lines_of(soup.body or soup)
+        if sum(len(l) for l in body_ls) > sum(len(l) for l in best):
+            best = body_ls
+    return best
+
+
 def fetch_body(url):
-    """return (실제URL, [[문장,…], …]) / 실패 시 빈 리스트"""
+    """return (실제URL, 문단리스트[[문장…]…], 상태)"""
     real = resolve_url(url)
     if "news.google.com" in real:
-        return real, []
+        return real, [], "google_unresolved"
     try:
-        res = requests.get(real, headers=HEADERS, timeout=10)
-        res.encoding = res.apparent_encoding
+        res = requests.get(real, headers=HEADERS, timeout=15)
         if res.status_code != 200:
-            return real, []
+            return real, [], f"http_{res.status_code}"
+        res.encoding = res.apparent_encoding
         soup = BeautifulSoup(res.text, "html.parser")
-        for t in soup(["script", "style", "nav", "footer", "aside", "header", "form"]):
-            t.decompose()
-        root = (soup.find("article")
-                or soup.find(id=re.compile("article|content|news", re.I))
-                or soup.body or soup)
-        texts = [p.get_text(" ", strip=True) for p in root.find_all("p")]
-        texts = [t for t in texts if len(t) >= 30]
-        if len(texts) < 2:
-            texts = [l.strip() for l in root.get_text("\n").split("\n") if len(l.strip()) >= 40]
 
-        paras, total, last = [], 0, None
-        for t in texts:
-            if t == last:
-                continue
-            last = t
-            total += len(t)
+        og = soup.find("meta", property="og:description") or soup.find("meta", attrs={"name": "description"})
+        og_text = (og.get("content") or "").strip() if og else ""
+
+        lines = extract_lines(soup)
+        paras, total = [], 0
+        for l in lines:
+            total += len(l)
             if total > BODY_MAX_CHARS:
                 break
-            sents = split_sentences(t)
+            sents = split_sentences(l)
             if sents:
                 paras.append(sents)
-        return real, paras
+
+        if paras and sum(len(s) for p in paras for s in p) >= 200:
+            return real, paras, "ok"
+        if og_text and len(og_text) >= 30:       # 전문 실패 시 요약문이라도
+            return real, [split_sentences(og_text)], "partial"
+        return real, paras, "no_text" if not paras else "ok"
     except Exception as e:
-        print(f"   ⚠️ 본문 수집 실패: {type(e).__name__}")
-        return real, []
+        return real, [], f"err_{type(e).__name__}"
 
 
 # ===== 뉴스 수집 =====
@@ -188,10 +244,12 @@ def fetch_all_news():
     unique = unique[:POOL_LIMIT]
 
     got = 0
-    for a in unique:
-        a["link"], a["paras"] = fetch_body(a["link"])
+    for n, a in enumerate(unique, 1):
+        a["link"], a["paras"], st = fetch_body(a["link"])
+        a["partial"] = (st == "partial")
         a["sents"] = [s for p in a["paras"] for s in p]
         got += 1 if a["sents"] else 0
+        print(f"   [{n:>2}] {st:<18} {len(a['sents']):>3}문장 | {a['link'][:70]}")
     print(f"   본문 수집 {got}/{len(unique)}건")
     return unique
 
@@ -382,7 +440,8 @@ def build_children(it, art):
              "icon": {"emoji": "💡"}, "color": "gray_background"}},
         {"object": "block", "type": "divider", "divider": {}},
         {"object": "block", "type": "heading_3",
-         "heading_3": {"rich_text": [{"type": "text", "text": {"content": "원문 기사"}}]}},
+         "heading_3": {"rich_text": [{"type": "text", "text": {"content":
+             "원문 기사 (요약문만 수집됨, 전문은 URL 참조)" if art.get("partial") else "원문 기사"}}]}},
     ]
 
     if not art["paras"]:
