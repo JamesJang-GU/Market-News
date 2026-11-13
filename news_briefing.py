@@ -50,7 +50,7 @@ def extract_article_details(entry):
     return real_url, article_text
 
 def get_ai_analysis(news_list):
-    """PwC Alpha AI를 사용하여 요약, 시사점, 하이라이트 분석 (모델 폴백 지원)"""
+    """PwC Alpha AI 모델을 사용하여 분석 (워크스페이스 확인 모델명 적용)"""
     url = "https://workspace.kr.pwc.com/api/workspace/coding_agent/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {ALPHA_API_KEY}",
@@ -82,8 +82,13 @@ def get_ai_analysis(news_list):
 ---END---
 """
 
-    # 시도할 모델 목록 (PwC Alpha API 지원 모델 순차 탐색)
-    models_to_try = ["gpt-4o-mini", "gpt-4-turbo", "gpt-4", "gpt-3.5-turbo"]
+    # 대시보드에서 확인된 실제 활성화 모델 식별자 목록
+    models_to_try = [
+        "vertex_ai.gemini-3.7-flash",
+        "bedrock.anthropic.claude-sonnet-4-6",
+        "openai.gpt-5.6-sol",
+        "bedrock.anthropic.claude-haiku-4-5"
+    ]
     
     for model_name in models_to_try:
         payload = {
@@ -93,21 +98,22 @@ def get_ai_analysis(news_list):
         }
         
         try:
+            print(f"[{model_name}] 모델로 AI 분석 시도 중...")
             response = requests.post(url, headers=headers, json=payload)
             if response.status_code == 200:
                 result = response.json()
                 if 'choices' in result and len(result['choices']) > 0:
-                    print(f"성공: [{model_name}] 모델로 분석 완료")
+                    print(f"SUCCESS: [{model_name}] 모델 분석 완료!")
                     return result['choices'][0]['message']['content']
             
-            print(f"모델 [{model_name}] 응답 실패: {response.status_code} - {response.text}")
+            print(f"FAIL: [{model_name}] 응답 코드 {response.status_code} - {response.text}")
         except Exception as e:
-            print(f"모델 [{model_name}] 요청 중 예외 발생: {e}")
+            print(f"ERROR: [{model_name}] 요청 오류 - {e}")
 
     return None
 
 def add_to_notion(title, url, category, summary, implication, highlights, stars, article_content):
-    """노션 DB에 행 추가"""
+    """노션 DB에 행 추가 및 본문 하이라이트 블록 생성"""
     notion_url = "https://api.notion.com/v1/pages"
     headers = {
         "Authorization": f"Bearer {NOTION_TOKEN}",
@@ -160,7 +166,7 @@ def add_to_notion(title, url, category, summary, implication, highlights, stars,
 
 def main():
     if not ALPHA_API_KEY or not NOTION_TOKEN or not DATABASE_ID:
-        print("필수 환경 변수(API_KEY, NOTION_TOKEN, DATABASE_ID)가 설정되지 않았습니다.")
+        print("환경 변수(API_KEY, NOTION_TOKEN, DATABASE_ID)를 확인하세요.")
         return
 
     all_news = []
@@ -181,7 +187,7 @@ def main():
 
     analysis_result = get_ai_analysis(all_news)
     if not analysis_result:
-        print("AI 분석 결과를 가져오지 못했습니다. API 키 또는 모델 권한을 확인하세요.")
+        print("AI 분석 결과를 가져오지 못했습니다.")
         return
     
     articles = analysis_result.split("---ARTICLE---")
@@ -217,7 +223,7 @@ def main():
                     data.get("분류", "종합·공급망"),
                     data.get("요약", ""),
                     data.get("시사점", ""),
-                    data["하이라이트"] if data["하이라이트"] else ["핵심 내용 본문 참조"],
+                    data["하이라이트"] if data["하이라이트"] else ["본문 주요 내용 참조"],
                     data.get("중요도", "★"),
                     orig['content']
                 )
