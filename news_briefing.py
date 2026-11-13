@@ -33,6 +33,11 @@ FILL_MIN_IMPACT = 2        # 5건 미달 시 채움 기준 (해운 제외)
 SIMILARITY = 0.6           # 제목 유사도 임계값
 AI_SENT_LIMIT = 12         # AI에 전달할 기사당 문장 수
 BODY_MAX_CHARS = 6000
+NEWS_WINDOW = os.environ.get("NEWS_WINDOW", "2d")      # Google News 검색 기간 (1d/2d/7d)
+RECENT_DAYS = 7                                         # 이 기간 내 Notion 적재 기사와 중복 제외
+FORCE_RUN = os.environ.get("FORCE_RUN", "0") == "1"     # 1이면 오늘 이미 적재돼 있어도 실행
+BODY_FIRST = os.environ.get("BODY_FIRST", "1") == "1"   # 1이면 본문 확보 기사에 +3점 가산
+KST = datetime.timezone(datetime.timedelta(hours=9))
 DEFAULT_CATEGORY = "종합·공급망"
 ALLOWED_CATEGORIES = ["해운", "항공", "육상", "철도", "창고·물류센터",
                       "규제·정책", "친환경·기술", "종합·공급망"]
@@ -51,6 +56,10 @@ HEADERS = {
 
 
 # ===== 유틸 =====
+def today_kst():
+    return datetime.datetime.now(KST).strftime("%Y-%m-%d")
+
+
 def clip(text, limit=1900):
     text = text or ""
     return text if len(text) <= limit else text[:limit - 1] + "…"
@@ -99,6 +108,12 @@ def resolve_url(url):
             print(f"   ⚠️ URL 해제 실패: {str(r.get('message'))[:80]}")
         except Exception as e:
             print(f"   ⚠️ URL 해제 예외: {type(e).__name__}: {str(e)[:80]}")
+    try:  # 보조: 리다이렉트 추적
+        r = requests.get(url, headers=HEADERS, timeout=10, allow_redirects=True)
+        if "news.google.com" not in r.url:
+            return r.url
+    except Exception:
+        pass
     return url
 
 
@@ -212,7 +227,7 @@ def fetch_ksg_news(limit=6):
 
 
 def fetch_google_news(query, count=5):
-    rss_url = (f"https://news.google.com/rss/search?q={urllib.parse.quote(query)}"
+    rss_url = (f"https://news.google.com/rss/search?q={urllib.parse.quote(query + f' when:{NEWS_WINDOW}')}"
                f"&hl=ko&gl=KR&ceid=KR:ko")
     articles = []
     try:
@@ -224,7 +239,7 @@ def fetch_google_news(query, count=5):
     return articles
 
 
-def fetch_all_news():
+def fetch_all_news(recent_titles=(), recent_urls=()):
     sources = [fetch_ksg_news()] + [fetch_google_news(q) for q in GOOGLE_QUERIES]
 
     # 소스별 라운드로빈 → 특정 소스 쏠림 방지
@@ -235,12 +250,20 @@ def fetch_all_news():
                 pool.append(s[i])
         i += 1
 
-    seen, unique = set(), []
+    seen, unique, skipped = set(), [], 0
+    recent_norm = [norm_title(t) for t in recent_titles]
     for a in pool:
-        key = norm_title(a["title"])[:30]
-        if key not in seen:
-            seen.add(key)
-            unique.append(a)
+        nt = norm_title(a["title"])
+        key = nt[:30]
+        if key in seen:
+            continue
+        if a["link"] in recent_urls or any(
+                difflib.SequenceMatcher(None, nt, r).ratio() >= SIMILARITY for r in recent_norm):
+            skipped += 1
+            continue
+        seen.add(key)
+        unique.append(a)
+    print(f"   최근 {RECENT_DAYS}일 적재 기사와 중복 제외: {skipped}건")
     unique = unique[:POOL_LIMIT]
 
     got = 0
@@ -311,9 +334,13 @@ def analyze_with_alpha_ai(articles):
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": f"다음 뉴스들을 분석해 주세요:\n\n{articles_text}"},
         ],
+        "temperature": 0,   # 실행마다 결과가 바뀌는 현상 최소화
     }
     try:
         r = requests.post(ALPHA_URL, headers=headers, json=payload, timeout=(10, 240))
+        if r.status_code == 400 and "temperature" in r.text.lower():
+            payload.pop("temperature", None)
+            r = requests.post(ALPHA_URL, headers=headers, json=payload, timeout=(10, 240))
         print(f"   Alpha status: {r.status_code}")
         if r.status_code != 200:
             print(f"   Alpha 응답 본문: {r.text[:500]}")
@@ -395,9 +422,19 @@ def is_dup(a, b, articles):
     return difflib.SequenceMatcher(None, ta, tb).ratio() >= SIMILARITY
 
 
-def prioritize(items, articles):
-    ranked = sorted(items, key=lambda x: (-score(x), x["idx"]))
+def prioritize(items, articles, limit=DAILY_LIMIT):
+    def has_body(it):
+        return bool(articles[it["idx"]]["sents"])
+
+    # 점수 = 영향도×10 (+2 해운·항공) (+3 본문 확보). 본문 가산은 동일 영향도 내 타이브레이크 수준
+    def total(it):
+        return score(it) + (3 if BODY_FIRST and has_body(it) else 0)
+
+    ranked = sorted(items, key=lambda x: (-total(x), x["idx"]))
     chosen = []
+
+    def meets_min(it):
+        return it["impact"] >= MIN_IMPACT.get(it["category"], DEFAULT_MIN_IMPACT)
 
     def try_add(it, sea_cap):
         if any(is_dup(it, c, articles) for c in chosen):
@@ -410,28 +447,26 @@ def prioritize(items, articles):
 
     # 1차: 최소 영향도 충족 기사 (해운 3번째는 영향도 5만)
     for it in ranked:
-        if len(chosen) >= DAILY_LIMIT:
+        if len(chosen) >= limit:
             break
-        if it["impact"] < MIN_IMPACT.get(it["category"], DEFAULT_MIN_IMPACT):
-            continue
-        try_add(it, SEA_MAX if it["impact"] >= 5 else SEA_SOFT)
+        if meets_min(it):
+            try_add(it, SEA_MAX if it["impact"] >= 5 else SEA_SOFT)
 
     # 2차: 미달 시 해운 제외 영향도 2 이상으로 채움
-    if len(chosen) < DAILY_LIMIT:
-        for it in ranked:
-            if len(chosen) >= DAILY_LIMIT:
-                break
-            if it in chosen or it["category"] == "해운" or it["impact"] < FILL_MIN_IMPACT:
-                continue
-            try_add(it, SEA_SOFT)
+    for it in ranked:
+        if len(chosen) >= limit:
+            break
+        if it in chosen or it["category"] == "해운" or it["impact"] < FILL_MIN_IMPACT:
+            continue
+        try_add(it, SEA_SOFT)
     return chosen
 
 
-def fallback_items(articles):
+def fallback_items(articles, limit=DAILY_LIMIT):
     return [{"idx": i, "impact": 3, "category": DEFAULT_CATEGORY, "group": "",
              "summary": "AI 분석 미수행, 원문 링크 참조", "insight": "AI 분석 실패로 생략",
              "highlights": []}
-            for i in range(min(DAILY_LIMIT, len(articles)))]
+            for i in range(min(limit, len(articles)))]
 
 
 # ===== Notion 본문 구성 =====
@@ -473,7 +508,7 @@ def build_children(it, art):
 
 # ===== Notion 적재 =====
 def save_to_notion(articles, items):
-    today_str = datetime.datetime.now().strftime("%Y-%m-%d")
+    today_str = today_kst()
     db_id = normalize_db_id(NOTION_DB_RAW)
     headers = {
         "Authorization": f"Bearer {NOTION_TOKEN}",
@@ -514,18 +549,65 @@ def save_to_notion(articles, items):
     return ok
 
 
+# ===== 최근 적재 이력 (중복·재실행 방지) =====
+def fetch_recent_notion():
+    """return (최근 제목 리스트, URL 집합, 오늘 적재 건수)"""
+    db_id = normalize_db_id(NOTION_DB_RAW)
+    headers = {
+        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Content-Type": "application/json",
+        "Notion-Version": "2022-06-28",
+    }
+    since = (datetime.datetime.now(KST) - datetime.timedelta(days=RECENT_DAYS)).strftime("%Y-%m-%d")
+    body = {"filter": {"property": "날짜", "date": {"on_or_after": since}}, "page_size": 100}
+    titles, urls, today_cnt = [], set(), 0
+    try:
+        res = requests.post(f"https://api.notion.com/v1/databases/{db_id}/query",
+                            headers=headers, json=body, timeout=30)
+        if res.status_code != 200:
+            print(f"⚠️ 최근 이력 조회 실패 ({res.status_code}): {res.text[:300]}")
+            return titles, urls, today_cnt
+        today = today_kst()
+        for row in res.json().get("results", []):
+            props = row.get("properties", {})
+            t = "".join(x.get("plain_text", "") for x in props.get("제목", {}).get("title", []))
+            u = props.get("URL", {}).get("url")
+            d = ((props.get("날짜", {}) or {}).get("date") or {}).get("start", "")
+            if t:
+                titles.append(t)
+            if u:
+                urls.add(u)
+            if d[:10] == today:
+                today_cnt += 1
+    except Exception as e:
+        print(f"⚠️ 최근 이력 조회 예외: {type(e).__name__}: {e}")
+    print(f"   최근 {RECENT_DAYS}일 적재 {len(titles)}건 / 오늘 {today_cnt}건")
+    return titles, urls, today_cnt
+
+
 # ===== 실행 =====
 def main():
     missing = [k for k, v in {"ALPHA_API_KEY": ALPHA_API_KEY, "NOTION_TOKEN": NOTION_TOKEN,
                               "NOTION_PARENT_PAGE_ID": NOTION_DB_RAW}.items() if not v]
     if missing:
         sys.exit(f"❌ 환경변수 누락: {missing}")
+    print(f"   googlenewsdecoder: {'사용 가능' if gnewsdecoder else '미설치 (requirements.txt 확인)'}")
+
+    print("0. 최근 적재 이력 확인 중...")
+    recent_titles, recent_urls, today_cnt = fetch_recent_notion()
+    remaining = DAILY_LIMIT - today_cnt
+    if remaining <= 0 and not FORCE_RUN:
+        print(f"ℹ️ 오늘({today_kst()}) 이미 {today_cnt}건 적재됨 → 종료 (재실행하려면 FORCE_RUN=1)")
+        return
+    if remaining <= 0:
+        remaining = DAILY_LIMIT
+    print(f"   오늘 추가 적재 목표: {remaining}건")
 
     print("1. 뉴스·본문 수집 중...")
-    articles = fetch_all_news()
+    articles = fetch_all_news(recent_titles, recent_urls)
     print(f"   후보 {len(articles)}개")
     if not articles:
-        sys.exit("❌ 기사 0건")
+        sys.exit("❌ 신규 기사 0건")
 
     print("2. Alpha AI 분석 중...")
     ai_analysis = analyze_with_alpha_ai(articles)
@@ -533,10 +615,10 @@ def main():
 
     if items:
         print("   AI 평가: " + ", ".join(f"{i['idx']+1}:{i['category']}/{i['impact']}" for i in items))
-        items = prioritize(items, articles)
+        items = prioritize(items, articles, remaining)
     elif FALLBACK_WITHOUT_AI:
         print("⚠️ AI 결과 없음 → 원문만 적재 (fallback)")
-        items = fallback_items(articles)
+        items = fallback_items(articles, remaining)
     else:
         sys.exit("❌ AI 분석 실패")
     print(f"   적재 대상 {len(items)}건: " + ", ".join(i["category"] for i in items))
