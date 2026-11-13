@@ -12,7 +12,6 @@ ALPHA_API_KEY = os.getenv("ALPHA_API_KEY")
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 DATABASE_ID = os.getenv("NOTION_PARENT_PAGE_ID")
 
-# --- 뉴스 수집 대상 ---
 RSS_URLS = {
     "해운·항만": "https://news.google.com/rss/search?q=" + urllib.parse.quote("해운 항만 물류 -쇼핑"),
     "항공·물류": "https://news.google.com/rss/search?q=" + urllib.parse.quote("항공 화물 물류"),
@@ -20,237 +19,154 @@ RSS_URLS = {
 }
 
 def extract_article_details(entry):
-    """구글 RSS 링크에서 실제 언론사 원문 URL 추출 및 본문 수집"""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-    }
-    
-    # 1. RSS 요약본 텍스트 미리 확보 (최후의 백업용)
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
     rss_snippet = ""
     if hasattr(entry, 'summary'):
-        rss_soup = BeautifulSoup(entry.summary, 'html.parser')
-        rss_snippet = rss_soup.get_text().strip()
+        rss_snippet = BeautifulSoup(entry.summary, 'html.parser').get_text().strip()
 
-    # 2. 구글 RSS 요약 내 실제 언론사 링크 추출 시도
     real_url = entry.link
-    if hasattr(entry, 'summary'):
-        rss_soup = BeautifulSoup(entry.summary, 'html.parser')
-        a_tag = rss_soup.find('a')
-        if a_tag and a_tag.get('href') and 'news.google.com' not in a_tag['href']:
-            real_url = a_tag['href']
-
     article_text = ""
     try:
-        res = requests.get(real_url, headers=headers, timeout=8, allow_redirects=True)
+        res = requests.get(real_url, headers=headers, timeout=10, allow_redirects=True)
         res.encoding = res.apparent_encoding or 'utf-8'
-        
         soup = BeautifulSoup(res.text, 'html.parser')
         
-        # 불필요한 태그 제거
         for tag in soup(["script", "style", "header", "footer", "nav", "aside", "form"]):
             tag.decompose()
             
-        # Meta description 수집
-        meta_desc = ""
-        meta_tag = soup.find('meta', property='og:description') or soup.find('meta', attrs={'name': 'description'})
-        if meta_tag and meta_tag.get('content'):
-            meta_desc = meta_tag['content'].strip()
-
-        # 본문 영역 탐색
         main_content = soup.find('article') or soup.find('main') or soup.find('div', class_=re.compile(r'(article|content|post|view)', re.I))
-        target_area = main_content if main_content else soup
-        
-        paragraphs = [p.get_text().strip() for p in target_area.find_all('p') if len(p.get_text().strip()) > 20]
-        article_text = "\n\n".join(paragraphs)
-
-        if not article_text and meta_desc:
-            article_text = meta_desc
-    except Exception:
+        target = main_content if main_content else soup
+        paragraphs = [p.get_text().strip() for p in target.find_all('p') if len(p.get_text().strip()) > 30]
+        article_text = "\n".join(paragraphs)
+    except:
         pass
 
-    # 본문 추출 실패 시 RSS snippet으로 대체하여 '수집 실패' 방지
-    if not article_text or len(article_text) < 50:
-        article_text = rss_snippet if rss_snippet else "원문 텍스트 수집이 제한된 사이트입니다. 상단 URL 속성의 링크에서 직접 확인 가능합니다."
+    if not article_text or len(article_text) < 100:
+        article_text = rss_snippet if rss_snippet else "원문 확인 필요"
 
     return real_url, article_text
 
 def get_ai_analysis(news_list):
-    """PwC Alpha AI를 사용하여 요약, 시사점, 하이라이트 생성"""
     url = "https://workspace.kr.pwc.com/api/workspace/coding_agent/v1/chat/completions"
     headers = {"Authorization": f"Bearer {ALPHA_API_KEY}", "Content-Type": "application/json"}
     
+    # 입력 데이터가 너무 크면 API 오류가 발생하므로 800자로 제한
     articles_payload = ""
     for i, news in enumerate(news_list):
-        articles_payload += f"---기사 {i+1}---\n제목: {news['title']}\n분류: {news['category']}\n본문: {news['content'][:1200]}\n\n"
+        articles_payload += f"---기사 {i+1}---\n제목: {news['title']}\n본문: {news['content'][:800]}\n\n"
 
     prompt = f"""
-당신은 물류/해운/공급망 전문가입니다. 아래 수집된 기사들을 분석하여 정확히 요청된 양식대로 응답하세요.
+당신은 물류 전문가입니다. 다음 기사들을 분석하여 '요약', '시사점', '하이라이트'를 추출하세요.
 
-[수집된 기사]
+[기사 목록]
 {articles_payload}
 
-[응답 작성 지침]
-각 기사마다 아래 구조를 완벽히 준수하여 출력하세요:
-
+[응답 양식]
+각 기사마다 반드시 아래 형식을 지키세요:
 ---ARTICLE---
-번호: (1부터 시작하는 숫자)
-분류: (해운·항만, 항공·물류, 친환경·기술, 정책·규제, 종합·공급망 중 가장 적합한 것 1개 선택)
-중요도: (★, ★★, ★★★ 중 선택)
-노션요약: (데이터베이스 속성용 1문장 핵심 요약)
-시사점: (물류 실무자 입장의 시사점/영향 1~2문장)
+번호: (숫자)
+분류: (해운·항만, 항공·물류, 친환경·기술, 정책·규제, 종합·공급망 중 택1)
+중요도: (★~★★★)
+요약: (기사 내용을 2문장으로 상세히 요약)
+시사점: (물류 실무에 주는 영향 1문장)
 하이라이트:
-- (핵심 하이라이트 내용 1)
-- (핵심 하이라이트 내용 2)
-- (핵심 하이라이트 내용 3)
+- (핵심 요약 포인트 1)
+- (핵심 요약 포인트 2)
+- (핵심 요약 포인트 3)
 ---END---
 """
 
     payload = {
         "model": "gpt-4o",
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.2
+        "temperature": 0.3
     }
     
     response = requests.post(url, headers=headers, json=payload)
-    return response.json()['choices'][0]['message']['content']
+    
+    # 에러 핸들링 강화
+    if response.status_code != 200:
+        print(f"API Error: {response.status_code} - {response.text}")
+        return None
+
+    result = response.json()
+    if 'choices' not in result:
+        print(f"Unexpected Response Format: {result}")
+        return None
+
+    return result['choices'][0]['message']['content']
 
 def add_to_notion(title, url, category, summary, implication, highlights, stars, article_content):
-    """노션 데이터베이스에 항목 추가 및 상세 본문(하이라이트 포함) 구성"""
     notion_url = "https://api.notion.com/v1/pages"
-    headers = {
-        "Authorization": f"Bearer {NOTION_TOKEN}",
-        "Content-Type": "application/json",
-        "Notion-Version": "2022-06-28"
-    }
+    headers = {"Authorization": f"Bearer {NOTION_TOKEN}", "Content-Type": "application/json", "Notion-Version": "2022-06-28"}
     
-    date_str = datetime.now().strftime("%Y-%m-%d")
-    clean_content = article_content[:1500]
-
-    # 본문 블록 구성 (콜아웃 + 하이라이트 + 원문요약)
     children_blocks = [
-        {
-            "object": "block",
-            "type": "callout",
-            "callout": {
-                "rich_text": [{"type": "text", "text": {"content": f"💡 AI 시사점\n{implication}"}}],
-                "icon": {"emoji": "💡"},
-                "color": "yellow_background"
-            }
-        },
-        {
-            "object": "block",
-            "type": "heading_3",
-            "heading_3": {"rich_text": [{"type": "text", "text": {"content": "📌 핵심 하이라이트"}}]}
-        }
+        {"object": "block", "type": "callout", "callout": {"rich_text": [{"text": {"content": f"💡 AI 시사점\n{implication}"}}], "icon": {"emoji": "💡"}, "color": "blue_background"}},
+        {"object": "block", "type": "heading_3", "heading_3": {"rich_text": [{"text": {"content": "📌 핵심 하이라이트"}}]}}
     ]
-
-    # 하이라이트 불렛 포인트 추가
     for hl in highlights:
-        children_blocks.append({
-            "object": "block",
-            "type": "bulleted_list_item",
-            "bulleted_list_item": {
-                "rich_text": [{"type": "text", "text": {"content": hl}}]
-            }
-        })
+        children_blocks.append({"object": "block", "type": "bulleted_list_item", "bulleted_list_item": {"rich_text": [{"text": {"content": hl}}]}})
 
-    # 구분선 및 원문 본문 추가
     children_blocks.extend([
-        {
-            "object": "block",
-            "type": "divider",
-            "divider": {}
-        },
-        {
-            "object": "block",
-            "type": "heading_3",
-            "heading_3": {"rich_text": [{"type": "text", "text": {"content": "📄 기사 본문 내용"}}]}
-        },
-        {
-            "object": "block",
-            "type": "paragraph",
-            "paragraph": {
-                "rich_text": [{"type": "text", "text": {"content": clean_content}}]
-            }
-        }
+        {"object": "block", "type": "divider", "divider": {}},
+        {"object": "block", "type": "heading_3", "heading_3": {"rich_text": [{"text": {"content": "📄 수집된 본문내용"}}]}},
+        {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": article_content[:1500]}}]}}
     ])
 
     payload = {
         "parent": {"database_id": DATABASE_ID},
         "properties": {
             "제목": {"title": [{"text": {"content": f"[{stars}] {title}"}}]},
-            "날짜": {"date": {"start": date_str}},
+            "날짜": {"date": {"start": datetime.now().strftime("%Y-%m-%d")}},
             "분류": {"select": {"name": category}},
             "요약": {"rich_text": [{"text": {"content": summary}}]},
             "URL": {"url": url}
         },
         "children": children_blocks
     }
-    
     requests.post(notion_url, headers=headers, json=payload)
 
 def main():
+    if not ALPHA_API_KEY or not NOTION_TOKEN:
+        print("API 토큰 설정이 누락되었습니다.")
+        return
+
     all_news = []
     for category, rss_url in RSS_URLS.items():
         feed = feedparser.parse(rss_url)
-        for entry in feed.entries[:3]: # 각 분야별 상위 3개 수집
+        for entry in feed.entries[:3]:
             real_url, content = extract_article_details(entry)
-            all_news.append({
-                "title": entry.title,
-                "link": real_url,
-                "category": category,
-                "content": content
-            })
+            all_news.append({"title": entry.title, "link": real_url, "category": category, "content": content})
+
+    if not all_news:
+        print("수집된 뉴스가 없습니다.")
+        return
 
     analysis_result = get_ai_analysis(all_news)
+    if not analysis_result:
+        print("AI 분석 결과를 가져오지 못했습니다.")
+        return
     
-    # AI 결과 파싱
     articles = analysis_result.split("---ARTICLE---")
     for art in articles:
-        if not art.strip(): continue
+        if "번호:" not in art: continue
         try:
-            lines = [line.strip() for line in art.split("\n") if line.strip()]
-            num = 0
-            category = "종합·공급망"
-            stars = "★"
-            summary = ""
-            implication = ""
-            highlights = []
-            
+            lines = [l.strip() for l in art.split("\n") if l.strip()]
+            data = {"하이라이트": []}
             is_hl = False
             for line in lines:
-                if line.startswith("번호:"):
-                    num = int(re.sub(r'[^0-9]', '', line))
-                elif line.startswith("분류:"):
-                    category = line.replace("분류:", "").strip()
-                elif line.startswith("중요도:"):
-                    stars = line.replace("중요도:", "").strip()
-                elif line.startswith("노션요약:"):
-                    summary = line.replace("노션요약:", "").strip()
-                    is_hl = False
-                elif line.startswith("시사점:"):
-                    implication = line.replace("시사점:", "").strip()
-                    is_hl = False
-                elif line.startswith("하이라이트:"):
-                    is_hl = True
-                elif is_hl and line.startswith("-"):
-                    highlights.append(line.lstrip("- ").strip())
+                if line.startswith("번호:"): data["번호"] = int(re.sub(r'[^0-9]', '', line))
+                elif line.startswith("분류:"): data["분류"] = line.split(":", 1)[1].strip()
+                elif line.startswith("중요도:"): data["중요도"] = line.split(":", 1)[1].strip()
+                elif line.startswith("요약:"): data["요약"] = line.split(":", 1)[1].strip(); is_hl = False
+                elif line.startswith("시사점:"): data["시사점"] = line.split(":", 1)[1].strip(); is_hl = False
+                elif line.startswith("하이라이트:"): is_hl = True
+                elif is_hl and line.startswith("-"): data["하이라이트"].append(line.lstrip("- ").strip())
 
-            if num > 0 and num <= len(all_news):
-                original = all_news[num - 1]
-                add_to_notion(
-                    original['title'],
-                    original['link'],
-                    category,
-                    summary,
-                    implication,
-                    highlights if highlights else ["본문 주요 내용 요약 참조"],
-                    stars,
-                    original['content']
-                )
+            orig = all_news[data["번호"] - 1]
+            add_to_notion(orig['title'], orig['link'], data.get("분류", "종합·공급망"), data.get("요약", ""), data.get("시사점", ""), data["하이라이트"], data.get("중요도", "★"), orig['content'])
         except Exception as e:
-            print(f"파싱 및 저장 중 오류 발생: {e}")
+            print(f"처리 중 오류: {e}")
 
 if __name__ == "__main__":
     main()
