@@ -54,7 +54,8 @@ def fetch_ksg_news():
 def fetch_google_logistics_news(count=5):
     """구글 뉴스 RSS에서 항공/육상/창고 등 종합 물류 뉴스 수집"""
     query = "항공물류 OR 화물운송 OR 물류센터 OR 공급망 OR 라스트마일"
-    rss_url = f"https://news.google.com/rss/search?q={query}&hl=ko&gl=KR&ceid=KR:ko"
+    encoded_query = quote(query)        # 공백·한글을 URL 형식으로 인코딩
+    rss_url = f"https://news.google.com/rss/search?q={encoded_query}&hl=ko&gl=KR&ceid=KR:ko"
     feed = feedparser.parse(rss_url)
     return [
         {"title": e.title, "link": e.link, "source": "Google News"}
