@@ -19,26 +19,44 @@ ALPHA_API_KEY = os.getenv("ALPHA_API_KEY")
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 DATABASE_ID = os.getenv("NOTION_PARENT_PAGE_ID")
 
-# 우선순위별 RSS 카테고리 구성
+# 노션 허용 카테고리 (8개로 엄격 제한)
+ALLOWED_CATEGORIES = [
+    "해상", "항공", "육상", "철도", "창고", "글로벌 공급망", "친환경&기술", "규제&정책"
+]
+
+# AI가 다른 단어를 출력하더라도 지정된 8개 카테고리로 자동 매핑
+CATEGORY_MAPPER = {
+    "해운": "해상", "항만": "해상", "해운·항만": "해상", "해상": "해상",
+    "항공": "항공", "항공·물류": "항공",
+    "육상": "육상", "육상·창고": "육상",
+    "철도": "철도",
+    "창고": "창고", "창고·물류센터": "창고",
+    "글로벌 공급망": "글로벌 공급망", "종합·공급망": "글로벌 공급망", "공급망": "글로벌 공급망",
+    "친환경&기술": "친환경&기술", "친환경·기술": "친환경&기술",
+    "규제&정책": "규제&정책", "규제·정책": "규제&정책", "정책·규제": "규제&정책"
+}
+
+# 우선순위별 RSS 수집 대상
 RSS_GROUPS = {
-    "group1": {  # 1순위: 해상/항공 (최대 3개)
-        "해운·항만": "https://news.google.com/rss/search?q=" + urllib.parse.quote("해운 항만 물류 -쇼핑"),
-        "항공·물류": "https://news.google.com/rss/search?q=" + urllib.parse.quote("항공 화물 물류")
+    "group1": {  # 1순위: 해상/항공 (합산 최대 3개)
+        "해상": "https://news.google.com/rss/search?q=" + urllib.parse.quote("해운 항만 해상물류 -쇼핑"),
+        "항공": "https://news.google.com/rss/search?q=" + urllib.parse.quote("항공 화물 항공사 -쇼핑")
     },
-    "group2": {  # 2순위: 창고/육상
-        "육상·창고": "https://news.google.com/rss/search?q=" + urllib.parse.quote("육상 운송 창고 풀필먼트 물류")
+    "group2": {  # 2순위: 육상/철도/창고
+        "육상": "https://news.google.com/rss/search?q=" + urllib.parse.quote("육상 운송 화물차 트럭"),
+        "철도": "https://news.google.com/rss/search?q=" + urllib.parse.quote("철도 물류 화물열차"),
+        "창고": "https://news.google.com/rss/search?q=" + urllib.parse.quote("물류창고 창고 풀필먼트")
     },
-    "group3": {  # 3순위: 친환경/기술/정책
-        "친환경·기술": "https://news.google.com/rss/search?q=" + urllib.parse.quote("친환경 물류 기술 자동화"),
-        "정책·규제": "https://news.google.com/rss/search?q=" + urllib.parse.quote("물류 정책 규제 국토부")
+    "group3": {  # 3순위: 공급망/기술/정책
+        "글로벌 공급망": "https://news.google.com/rss/search?q=" + urllib.parse.quote("글로벌 공급망 리스크 수입 수출"),
+        "친환경&기술": "https://news.google.com/rss/search?q=" + urllib.parse.quote("친환경 물류 자율주행 로봇 스마트물류"),
+        "규제&정책": "https://news.google.com/rss/search?q=" + urllib.parse.quote("물류 정책 규제 국토부 관세청")
     }
 }
 
 def clean_title(title):
     """기사 제목에서 별표 및 출처(- 언론사) 삭제하여 순수 제목만 추출"""
-    # 1. 제목 끝의 "- 언론사명" 제거
     title = re.sub(r'\s*-\s*[^-]+$', '', title).strip()
-    # 2. 앞쪽의 대괄호 태그 [★], [속보] 등 제거
     title = re.sub(r'^\[.*?\]\s*', '', title).strip()
     return title
 
@@ -101,9 +119,9 @@ def collect_top_5_news():
                 "category": cat,
                 "content": content
             })
-    selected_news.extend(g1_items[:3]) # 최대 3개 제한
+    selected_news.extend(g1_items[:3])
 
-    # 2. Group 2 (창고/육상) 수집
+    # 2. Group 2 (육상/철도/창고) 수집
     g2_items = []
     for cat, url in RSS_GROUPS["group2"].items():
         feed = feedparser.parse(url)
@@ -116,7 +134,7 @@ def collect_top_5_news():
                 "content": content
             })
 
-    # 3. Group 3 (친환경/기술/정책) 수집
+    # 3. Group 3 (공급망/기술/정책) 수집
     g3_items = []
     for cat, url in RSS_GROUPS["group3"].items():
         feed = feedparser.parse(url)
@@ -129,7 +147,6 @@ def collect_top_5_news():
                 "content": content
             })
 
-    # 남은 자리를 Group 2와 Group 3 순서대로 채워 총 5개 맞춤
     for item in g2_items + g3_items:
         if len(selected_news) >= 5:
             break
@@ -137,8 +154,18 @@ def collect_top_5_news():
 
     return selected_news[:5]
 
+def sanitize_category(raw_cat):
+    """입력받은 분류명을 허용된 8개 카테고리 중 하나로 정리"""
+    raw_cat = raw_cat.strip()
+    if raw_cat in CATEGORY_MAPPER:
+        return CATEGORY_MAPPER[raw_cat]
+    for allowed in ALLOWED_CATEGORIES:
+        if allowed in raw_cat or raw_cat in allowed:
+            return allowed
+    return "글로벌 공급망"  # 기본값
+
 def get_ai_analysis(news_list):
-    """PwC Alpha AI를 사용하여 개조식/명사형 어미 요약 및 분석"""
+    """PwC Alpha AI를 사용하여 뉴스 분석 (지정 카테고리 및 명사형 어미 강제)"""
     base_url = "https://workspace.kr.pwc.com/api/workspace/coding_agent/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {ALPHA_API_KEY}",
@@ -159,23 +186,24 @@ def get_ai_analysis(news_list):
         articles_payload += f"---기사 {i+1}---\n제목: {news['title']}\n본문: {news['content'][:800]}\n\n"
 
     prompt = f"""
-당신은 물류/공급망 전문 분석가입니다. 다음 5개 기사를 분석하여 지침에 따라 작성을 완료하세요.
+당신은 물류/공급망 전문 분석가입니다. 다음 5개 기사를 분석하여 지침에 따라 작성하세요.
 
 [기사 목록]
 {articles_payload}
 
-[작성 지침]
-1. 요약: 기사의 핵심 내용을 1~2줄의 개조식 문장으로 작성하세요.
-   ★ 중요: 모든 문장의 어미는 반드시 명사형(~함, ~음, ~임, ~확대, ~추진, ~전망, ~증가 등)으로 마칠 것!
-2. 시사점: 물류 실무 관점의 영향 1문장 (개조식 명사형 어미 필수).
-3. 하이라이트: 핵심 요약 포인트 3개 (개조식 명사형 어미 필수).
+[작성 지침 - 엄격 준수]
+1. 분류: 반드시 다음 8개 중 가장 적합한 1개만 선택하세요. (다른 조합/복수 키워드 절대 금지!)
+   - 선택 가능 카테고리: [해상, 항공, 육상, 철도, 창고, 글로벌 공급망, 친환경&기술, 규제&정책]
+2. 요약: 기사 핵심 내용을 명사형 어미로 끝나는 ★단 1문장★으로 압축 작성하세요. (2문장 절대 금지)
+   - 어미 예시: ~함, ~음, ~임, ~확대, ~추진, ~전망, ~증가, ~지속 등
+3. 시사점: 물류 실무 관점 영향 단 1문장 (개조식 명사형 어미 필수).
+4. 하이라이트: 핵심 요약 포인트 3개 (개조식 명사형 어미 필수).
 
 [응답 양식]
-각 기사마다 아래 형식을 완벽히 지키세요:
 ---ARTICLE---
 번호: (숫자)
-분류: (해운·항만, 항공·물류, 육상·창고, 친환경·기술, 정책·규제 중 택1)
-요약: (명사형 어미로 끝나는 1~2줄 개조식 요약)
+분류: (해상, 항공, 육상, 철도, 창고, 글로벌 공급망, 친환경&기술, 규제&정책 중 택1)
+요약: (명사형 어미로 끝나는 단 1문장 요약)
 시사점: (명사형 어미로 끝나는 1문장 시사점)
 하이라이트:
 - (명사형 어미 포인트 1)
@@ -209,7 +237,7 @@ def get_ai_analysis(news_list):
     return None
 
 def add_to_notion(title, url, category, summary, implication, highlights, article_content):
-    """노션 DB 행 및 본문 등록 (별표 제거된 순수 제목 사용)"""
+    """노션 DB 행 및 본문 등록"""
     notion_url = "https://api.notion.com/v1/pages"
     headers = {
         "Authorization": f"Bearer {NOTION_TOKEN}",
@@ -217,8 +245,8 @@ def add_to_notion(title, url, category, summary, implication, highlights, articl
         "Notion-Version": "2022-06-28"
     }
     
-    # 순수한 기사 제목 사용
     pure_title = clean_title(title)
+    final_category = sanitize_category(category)  # 카테고리 검증 및 매핑
 
     children_blocks = [
         {
@@ -256,7 +284,7 @@ def add_to_notion(title, url, category, summary, implication, highlights, articl
         "properties": {
             "제목": {"title": [{"text": {"content": pure_title}}]},
             "날짜": {"date": {"start": datetime.now().strftime("%Y-%m-%d")}},
-            "분류": {"multi_select": [{"name": category}]},
+            "분류": {"multi_select": [{"name": final_category}]},
             "요약": {"rich_text": [{"text": {"content": summary}}]},
             "URL": {"url": url}
         },
@@ -265,7 +293,7 @@ def add_to_notion(title, url, category, summary, implication, highlights, articl
     
     res = requests.post(notion_url, headers=headers, json=payload)
     if res.status_code == 200:
-        print(f"✅ 노션 등록 성공: {pure_title[:30]}...", flush=True)
+        print(f"✅ 노션 등록 성공: [{final_category}] {pure_title[:25]}...", flush=True)
     else:
         print(f"❌ 노션 등록 실패 ({res.status_code}): {res.text}", flush=True)
 
@@ -274,14 +302,13 @@ def main():
         print("환경 변수(ALPHA_API_KEY, NOTION_TOKEN, NOTION_PARENT_PAGE_ID) 설정을 확인하세요.", flush=True)
         return
 
-    # 지침에 따른 5개 뉴스 수집 (해상/항공 3개 제한 및 2,3순위 구성)
     all_news = collect_top_5_news()
 
     if not all_news:
         print("수집된 뉴스가 없습니다.", flush=True)
         return
 
-    print(f"총 {len(all_news)}개 기사 수집 완료 (해상/항공 최대 3개 제한 적용). AI 분석을 시작합니다.", flush=True)
+    print(f"총 {len(all_news)}개 기사 수집 완료. AI 분석을 시작합니다.", flush=True)
 
     analysis_result = get_ai_analysis(all_news)
     if not analysis_result:
