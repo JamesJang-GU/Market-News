@@ -8,6 +8,7 @@ on:
 jobs:
   run-briefing:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
     - name: 코드 체크아웃
@@ -27,4 +28,6 @@ jobs:
         ALPHA_API_KEY: ${{ secrets.ALPHA_API_KEY }}
         NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
         NOTION_PARENT_PAGE_ID: ${{ secrets.NOTION_PARENT_PAGE_ID }}
+        FALLBACK_WITHOUT_AI: "1"   # AI 실패 시에도 규칙 기반으로 노션 적재 ("0"이면 실패 처리)
+        PYTHONUNBUFFERED: "1"
       run: python news_briefing.py

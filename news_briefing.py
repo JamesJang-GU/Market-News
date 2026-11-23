@@ -11,10 +11,22 @@
  - AI 응답 파싱 강화 (마크다운/구분자 누락 대응)
  - 해상 1~3건 조건 코드 레벨 강제
  - 날짜 KST 기준 저장
+ - [업로드 안정화]
+   · 실행 초기에 노션 DB 접근·속성 점검 (실패 원인 로그 출력)
+   · DB ID 정규화 (URL/하이픈 형태 허용)
+   · 제목(Title) 속성명 자동 감지, 분류 select/multi-select 모두 지원
+   · AI 실패·응답 파싱 실패 시에도 규칙 기반 선별로 노션 적재 (FALLBACK_WITHOUT_AI)
+   · AI 선별 결과가 5건 미만이면 미선택 후보로 보충
+   · 노션 429/5xx 재시도
+   · 적재 0건·설정 오류 시 exit 1 → Actions 실패(빨간불) 표시
+   · 제목 이중 정제로 '아시아-유럽' 같은 제목이 잘리던 버그 수정
+   · RSS를 requests로 받아 타임아웃·응답코드 로그 확보
 """
 
 import os
 import re
+import sys
+import time
 import calendar
 import urllib.parse
 from datetime import datetime, timedelta, timezone
@@ -32,10 +44,21 @@ except ImportError:
     except ImportError:
         _gn_decode = None
 
+
+def normalize_db_id(raw):
+    """DB URL / 하이픈 포함 UUID / 32자리 ID → 32자리 ID"""
+    s = (raw or "").strip().split("?")[0].split("#")[0].rstrip("/")
+    s = s.rsplit("/", 1)[-1]
+    m = re.search(r"([0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?"
+                  r"[0-9a-fA-F]{4}-?[0-9a-fA-F]{12})$", s)
+    return m.group(1).replace("-", "").lower() if m else s
+
+
 # --- 설정 (Environment Variables) ---
 ALPHA_API_KEY = os.getenv("ALPHA_API_KEY")
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
-DATABASE_ID = os.getenv("NOTION_PARENT_PAGE_ID")   # 반드시 '데이터베이스 ID'여야 함
+DATABASE_ID = normalize_db_id(os.getenv("NOTION_PARENT_PAGE_ID"))   # 반드시 '데이터베이스 ID'여야 함
+FALLBACK_WITHOUT_AI = os.getenv("FALLBACK_WITHOUT_AI", "1") != "0"  # AI 실패 시 규칙 기반 적재
 
 KST = timezone(timedelta(hours=9))
 
@@ -43,6 +66,10 @@ NOTION_HEADERS = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
     "Content-Type": "application/json",
     "Notion-Version": "2022-06-28",
+}
+BROWSER_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 }
 
 LLM_URL = "https://workspace.kr.pwc.com/api/workspace/coding_agent/v1/chat/completions"
@@ -70,6 +97,10 @@ CATEGORY_MAPPER = {
     "친환경&기술": "친환경&기술", "친환경·기술": "친환경&기술",
     "규제&정책": "규제&정책", "규제·정책": "규제&정책", "정책·규제": "규제&정책",
 }
+
+# 노션 DB 속성 (제목 속성명은 실행 시 자동 감지)
+PROPS = {"title": "제목", "date": "날짜", "category": "분류", "summary": "요약", "url": "URL"}
+CATEGORY_TYPE = "multi_select"   # 실행 시 DB 스키마에 맞춰 select/multi_select 결정
 
 # --- RSS 소스 ---
 def gnews_rss(query, days=1):
@@ -107,8 +138,9 @@ MARITIME_MIN, MARITIME_MAX = 1, 3
 # 유틸
 # ============================================================
 def clean_title(title):
-    """제목 정제: 출처 및 [태그] 삭제"""
-    title = re.sub(r'\s*-\s*[^-]+$', '', title or '').strip()
+    """제목 정제: 끝의 ' - 언론사' 및 앞의 [태그] 삭제
+    (하이픈 양옆 공백이 있을 때만 출처로 판단 → '아시아-유럽' 같은 제목 보존)"""
+    title = re.sub(r'\s+-\s+[^-]+$', '', title or '').strip()
     title = re.sub(r'^\[.*?\]\s*', '', title).strip()
     return title
 
@@ -134,6 +166,121 @@ def rt(text, limit=2000):
     """노션 rich_text 1개 객체 최대 2000자 제한 대응"""
     return [{"type": "text", "text": {"content": (text or "")[:limit]}}]
 
+def first_sentence(text, limit=150):
+    """규칙 기반 적재용 요약: 본문 첫 문장"""
+    text = (text or "").strip().split("\n")[0]
+    m = re.search(r"^(.+?[.!?])(\s|$)", text)
+    s = m.group(1) if m else text
+    return s[:limit]
+
+
+# ============================================================
+# 노션 API
+# ============================================================
+def notion_request(method, url, **kwargs):
+    """노션 API 호출 (429/5xx/네트워크 오류 시 최대 3회 재시도). 실패 시 None 또는 마지막 응답"""
+    res = None
+    for attempt in range(1, 4):
+        try:
+            res = requests.request(method, url, headers=NOTION_HEADERS, timeout=30, **kwargs)
+        except requests.RequestException as e:
+            print(f"⚠️ 노션 요청 오류({attempt}/3): {e}", flush=True)
+            res = None
+            time.sleep(2 * attempt)
+            continue
+        if res.status_code == 429 or res.status_code >= 500:
+            wait = float(res.headers.get("Retry-After") or 2 * attempt)
+            print(f"⚠️ 노션 응답 {res.status_code} → {wait:.0f}초 후 재시도({attempt}/3)", flush=True)
+            time.sleep(wait)
+            continue
+        return res
+    return res
+
+NOTION_ERROR_HINTS = {
+    400: "DB ID 형식 오류이거나, 페이지 ID를 넣었을 가능성 (NOTION_PARENT_PAGE_ID에는 '데이터베이스 ID' 필요)",
+    401: "NOTION_TOKEN 값 오류 (Integration 토큰 재확인)",
+    403: "Integration 권한 부족 (Capabilities에서 Read/Insert content 허용 확인)",
+    404: "DB를 찾을 수 없음 → DB 우측 상단 ⋯ → Connections에 Integration 추가했는지, "
+         "DB ID가 맞는지(링크된 DB 뷰가 아닌 원본 DB인지) 확인",
+}
+
+def check_notion_db():
+    """노션 DB 접근 및 속성 점검. 성공 시 PROPS/CATEGORY_TYPE 갱신 후 True"""
+    global CATEGORY_TYPE
+    print(f"노션 DB 점검: ID {DATABASE_ID[:6]}…{DATABASE_ID[-4:]} (길이 {len(DATABASE_ID)})", flush=True)
+    if not re.fullmatch(r"[0-9a-f]{32}", DATABASE_ID):
+        print("❌ NOTION_PARENT_PAGE_ID가 32자리 ID 형식이 아님. DB URL의 32자리 ID를 등록할 것.", flush=True)
+        return False
+
+    res = notion_request("GET", f"https://api.notion.com/v1/databases/{DATABASE_ID}")
+    if res is None:
+        print("❌ 노션 API 접속 실패 (네트워크)", flush=True)
+        return False
+    if res.status_code != 200:
+        print(f"❌ 노션 DB 접근 실패 ({res.status_code}): {res.text[:300]}", flush=True)
+        hint = NOTION_ERROR_HINTS.get(res.status_code)
+        if hint:
+            print(f"   → 조치: {hint}", flush=True)
+        return False
+
+    props = res.json().get("properties", {})
+    types = {name: p.get("type") for name, p in props.items()}
+    print(f"노션 DB 속성: {types}", flush=True)
+
+    # 제목(Title) 속성은 DB마다 1개 → 이름이 달라도 자동 사용
+    title_names = [n for n, t in types.items() if t == "title"]
+    if title_names and title_names[0] != PROPS["title"]:
+        print(f"ℹ️ 제목 속성명 '{title_names[0]}' 자동 사용", flush=True)
+        PROPS["title"] = title_names[0]
+
+    problems = []
+    expected = {"date": ("date",), "category": ("multi_select", "select"),
+                "summary": ("rich_text",), "url": ("url",)}
+    for key, allowed in expected.items():
+        name = PROPS[key]
+        if name not in types:
+            problems.append(f"'{name}' 속성 없음 (필요 타입: {'/'.join(allowed)})")
+        elif types[name] not in allowed:
+            problems.append(f"'{name}' 속성 타입이 {types[name]} → {'/'.join(allowed)} 필요")
+    if problems:
+        for p in problems:
+            print(f"❌ 노션 DB 속성 불일치: {p}", flush=True)
+        return False
+
+    CATEGORY_TYPE = types[PROPS["category"]]
+    print(f"✅ 노션 DB 점검 통과 (분류 타입: {CATEGORY_TYPE})", flush=True)
+    return True
+
+
+def fetch_existing_from_notion(days=DEDUP_LOOKBACK_DAYS):
+    """최근 N일 동안 노션에 저장된 URL/제목 집합 반환"""
+    url = f"https://api.notion.com/v1/databases/{DATABASE_ID}/query"
+    since = (datetime.now(KST) - timedelta(days=days)).strftime("%Y-%m-%d")
+    body = {"filter": {"property": PROPS["date"], "date": {"on_or_after": since}}, "page_size": 100}
+    urls, titles = set(), set()
+
+    while True:
+        res = notion_request("POST", url, json=body)
+        if res is None or res.status_code != 200:
+            detail = f"({res.status_code}): {res.text[:200]}" if res is not None else "(네트워크)"
+            print(f"⚠️ 노션 기존 기사 조회 실패{detail} → 중복 체크 없이 진행", flush=True)
+            break
+        data = res.json()
+        for page in data.get("results", []):
+            props = page.get("properties", {})
+            u = (props.get(PROPS["url"]) or {}).get("url")
+            if u:
+                urls.add(u)
+            t = (props.get(PROPS["title"]) or {}).get("title", [])
+            if t:
+                titles.add(norm_title("".join(x.get("plain_text", "") for x in t)))
+        if not data.get("has_more"):
+            break
+        body["start_cursor"] = data["next_cursor"]
+
+    print(f"노션 기존 기사 로드: URL {len(urls)}건 / 제목 {len(titles)}건", flush=True)
+    return urls, titles
+
 
 # ============================================================
 # 원문 URL 복원 및 본문 추출
@@ -152,10 +299,6 @@ def decode_google_news_url(url):
 
 def extract_article_details(entry):
     """뉴스 원문 URL 추적 및 본문 텍스트 수집"""
-    headers = {
-        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-    }
     rss_snippet = ""
     if hasattr(entry, "summary"):
         rss_snippet = BeautifulSoup(entry.summary, "html.parser").get_text().strip()
@@ -164,7 +307,7 @@ def extract_article_details(entry):
     article_text = ""
 
     try:
-        res = requests.get(real_url, headers=headers, timeout=10, allow_redirects=True)
+        res = requests.get(real_url, headers=BROWSER_HEADERS, timeout=10, allow_redirects=True)
         if res.status_code != 200:
             print(f"⚠️ 원문 응답 {res.status_code}: {real_url[:80]}", flush=True)
         res.encoding = res.apparent_encoding or "utf-8"
@@ -203,44 +346,23 @@ def extract_article_details(entry):
 
 
 # ============================================================
-# 노션 중복 방지
-# ============================================================
-def fetch_existing_from_notion(days=DEDUP_LOOKBACK_DAYS):
-    """최근 N일 동안 노션에 저장된 URL/제목 집합 반환"""
-    url = f"https://api.notion.com/v1/databases/{DATABASE_ID}/query"
-    since = (datetime.now(KST) - timedelta(days=days)).strftime("%Y-%m-%d")
-    body = {"filter": {"property": "날짜", "date": {"on_or_after": since}}, "page_size": 100}
-    urls, titles = set(), set()
-
-    while True:
-        try:
-            res = requests.post(url, headers=NOTION_HEADERS, json=body, timeout=30)
-        except Exception as e:
-            print(f"⚠️ 노션 기존 기사 조회 오류: {e}", flush=True)
-            break
-        if res.status_code != 200:
-            print(f"⚠️ 노션 기존 기사 조회 실패({res.status_code}): {res.text[:200]}", flush=True)
-            break
-        data = res.json()
-        for page in data.get("results", []):
-            props = page.get("properties", {})
-            u = (props.get("URL") or {}).get("url")
-            if u:
-                urls.add(u)
-            t = (props.get("제목") or {}).get("title", [])
-            if t:
-                titles.add(norm_title("".join(x.get("plain_text", "") for x in t)))
-        if not data.get("has_more"):
-            break
-        body["start_cursor"] = data["next_cursor"]
-
-    print(f"노션 기존 기사 로드: URL {len(urls)}건 / 제목 {len(titles)}건", flush=True)
-    return urls, titles
-
-
-# ============================================================
 # 후보 수집
 # ============================================================
+def fetch_feed(url, cat):
+    """RSS 다운로드(타임아웃·응답코드 확인) 후 파싱"""
+    try:
+        res = requests.get(url, headers=BROWSER_HEADERS, timeout=20)
+    except requests.RequestException as e:
+        print(f"⚠️ [{cat}] RSS 요청 오류: {e}", flush=True)
+        return []
+    if res.status_code != 200:
+        print(f"⚠️ [{cat}] RSS 응답 {res.status_code}: {url[:100]}", flush=True)
+        return []
+    feed = feedparser.parse(res.content)
+    if getattr(feed, "bozo", 0) and not feed.entries:
+        print(f"⚠️ [{cat}] RSS 파싱 실패: {feed.get('bozo_exception')}", flush=True)
+    return feed.entries
+
 def collect_candidate_news(seen_urls, seen_titles):
     candidates = []
     used_titles = set(seen_titles)
@@ -251,11 +373,8 @@ def collect_candidate_news(seen_urls, seen_titles):
     for cat, urls in RSS_SOURCES.items():
         entries, seen_links = [], set()
         for u in urls:
-            feed = feedparser.parse(u)
-            if getattr(feed, "bozo", 0) and not feed.entries:
-                print(f"⚠️ [{cat}] RSS 파싱 실패: {u[:100]}", flush=True)
-            for e in feed.entries:
-                if e.link not in seen_links:
+            for e in fetch_feed(u, cat):
+                if e.get("link") and e.link not in seen_links:
                     seen_links.add(e.link)
                     entries.append(e)
 
@@ -274,7 +393,7 @@ def collect_candidate_news(seen_urls, seen_titles):
                 skipped_old += 1
                 continue
 
-            title = clean_title(e.title)
+            title = clean_title(e.get("title", ""))
             key = norm_title(title)
             if not key or key in used_titles:
                 skipped_dup += 1
@@ -306,16 +425,21 @@ def call_llm(prompt):
         payload = {"model": model_name, "messages": [{"role": "user", "content": prompt}], "temperature": 0.2}
         try:
             print(f"[{model_name}] 모델 요청 중...", flush=True)
-            response = requests.post(LLM_URL, headers=headers, json=payload, timeout=90)
+            response = requests.post(LLM_URL, headers=headers, json=payload, timeout=(10, 120))
             if response.status_code == 200:
-                result = response.json()
+                try:
+                    result = response.json()
+                except ValueError:
+                    result = {}
                 if result.get("choices"):
                     content = result["choices"][0]["message"]["content"] or ""
                     content = re.sub(r"```[a-zA-Z]*", "", content).replace("```", "").strip()
                     if content:
                         print(f"SUCCESS: [{model_name}] 응답 수신", flush=True)
                         return content
-            print(f"FAIL: [{model_name}] 응답 코드 {response.status_code}", flush=True)
+            # 실패 원인 파악용 응답 일부 출력 (방화벽 차단 페이지, 인증 오류 등)
+            body = re.sub(r"\s+", " ", response.text or "")[:200]
+            print(f"FAIL: [{model_name}] 응답 코드 {response.status_code} / 본문: {body}", flush=True)
         except Exception as e:
             print(f"ERROR: [{model_name}] 요청 오류 - {e}", flush=True)
     return None
@@ -401,10 +525,57 @@ def parse_articles(text):
 # ============================================================
 # 선별 + 해상 조건 강제
 # ============================================================
+def rule_based_item(idx, cand):
+    """AI 없이 적재할 항목 (본문 첫 문장을 요약으로 사용)"""
+    return {
+        "후보번호": idx,
+        "final_cat": cand["category"],
+        "요약": first_sentence(cand["content"]) or cand["title"],
+        "시사점": "AI 분석 미수행 – 원문 확인 필요",
+        "하이라이트": [],
+        "rule_based": True,
+    }
+
+def fill_rule_based(selected, candidates, target=TARGET_COUNT):
+    """선별 결과가 target 미만이면 미선택 후보로 보충
+    (카테고리 순환 → 다양성 확보, 해상 상한 준수, 해상 0건이면 해상 우선)"""
+    used = {d["후보번호"] for d in selected}
+    m_count = sum(1 for d in selected if d["final_cat"] == "해상")
+
+    by_cat = {}
+    for i, c in enumerate(candidates, start=1):
+        if i not in used:
+            by_cat.setdefault(c["category"], []).append(i)
+    order = list(RSS_SOURCES.keys())
+    if m_count >= MARITIME_MIN and "해상" in order:     # 해상 충족 시 다른 분야 먼저
+        order.remove("해상")
+        order.append("해상")
+
+    added = 0
+    while len(selected) < target and any(by_cat.values()):
+        for cat in order:
+            if len(selected) >= target:
+                break
+            if not by_cat.get(cat):
+                continue
+            if cat == "해상" and m_count >= MARITIME_MAX:
+                by_cat[cat] = []
+                continue
+            idx = by_cat[cat].pop(0)
+            selected.append(rule_based_item(idx, candidates[idx - 1]))
+            added += 1
+            if cat == "해상":
+                m_count += 1
+    if added:
+        print(f"ℹ️ 규칙 기반 보충 {added}건", flush=True)
+    return selected
+
 def select_articles(candidates):
+    """AI 선별. AI 호출/파싱 실패 시 빈 리스트"""
     indexed = list(enumerate(candidates, start=1))
     content = call_llm(build_prompt(indexed, TARGET_COUNT, maritime_rule=True))
     if not content:
+        print("⚠️ 모든 AI 모델 호출 실패", flush=True)
         return []
 
     selected, used_idx = [], set()
@@ -415,6 +586,10 @@ def select_articles(candidates):
         used_idx.add(idx)
         d["final_cat"] = sanitize_category(d.get("분류") or candidates[idx - 1]["category"])
         selected.append(d)
+
+    if not selected:
+        print(f"⚠️ AI 응답 파싱 결과 0건. 응답 앞부분: {content[:300]!r}", flush=True)
+        return []
 
     # 해상 최대 3건 초과 시 초과분 제거
     kept, m_count = [], 0
@@ -436,7 +611,7 @@ def select_articles(candidates):
             idx, cand = pool[0]
             single = call_llm(build_prompt([(idx, cand)], 1, maritime_rule=False))
             parsed = parse_articles(single) if single else []
-            forced = parsed[0] if parsed else {"후보번호": idx, "요약": "", "시사점": "", "하이라이트": []}
+            forced = parsed[0] if parsed else rule_based_item(idx, cand)
             forced["후보번호"] = idx
             forced["final_cat"] = "해상"
             if len(selected) >= TARGET_COUNT:
@@ -451,17 +626,16 @@ def select_articles(candidates):
 # 노션 저장
 # ============================================================
 def add_to_notion(title, url, category, summary, implication, highlights, article_content):
-    notion_url = "https://api.notion.com/v1/pages"
-    pure_title = clean_title(title)
-
     children = [
         {"object": "block", "type": "callout", "callout": {
             "rich_text": rt(f"AI 시사점\n{implication}"),
             "icon": {"emoji": "💡"}, "color": "yellow_background"}},
-        {"object": "block", "type": "heading_3", "heading_3": {"rich_text": rt("📌 핵심 하이라이트")}},
     ]
-    for hl in highlights:
-        if hl.strip():
+    highlights = [h for h in highlights if h.strip()]
+    if highlights:
+        children.append({"object": "block", "type": "heading_3",
+                         "heading_3": {"rich_text": rt("📌 핵심 하이라이트")}})
+        for hl in highlights:
             children.append({"object": "block", "type": "bulleted_list_item",
                              "bulleted_list_item": {"rich_text": rt(hl)}})
     children.extend([
@@ -470,25 +644,29 @@ def add_to_notion(title, url, category, summary, implication, highlights, articl
         {"object": "block", "type": "paragraph", "paragraph": {"rich_text": rt(article_content, 1500)}},
     ])
 
+    if CATEGORY_TYPE == "select":
+        category_value = {"select": {"name": category}}
+    else:
+        category_value = {"multi_select": [{"name": category}]}
+
     payload = {
         "parent": {"database_id": DATABASE_ID},
         "properties": {
-            "제목": {"title": [{"text": {"content": pure_title[:2000]}}]},
-            "날짜": {"date": {"start": datetime.now(KST).strftime("%Y-%m-%d")}},
-            "분류": {"multi_select": [{"name": category}]},
-            "요약": {"rich_text": [{"text": {"content": (summary or "")[:2000]}}]},
-            "URL": {"url": url},
+            PROPS["title"]: {"title": [{"text": {"content": (title or "(제목 없음)")[:2000]}}]},
+            PROPS["date"]: {"date": {"start": datetime.now(KST).strftime("%Y-%m-%d")}},
+            PROPS["category"]: category_value,
+            PROPS["summary"]: {"rich_text": [{"text": {"content": (summary or "")[:2000]}}]},
+            PROPS["url"]: {"url": url or None},
         },
         "children": children,
     }
 
-    try:
-        res = requests.post(notion_url, headers=NOTION_HEADERS, json=payload, timeout=30)
-    except Exception as e:
-        print(f"❌ 노션 요청 오류: {e}", flush=True)
+    res = notion_request("POST", "https://api.notion.com/v1/pages", json=payload)
+    if res is None:
+        print(f"❌ 노션 요청 오류(네트워크): {title[:25]}", flush=True)
         return False
     if res.status_code == 200:
-        print(f"✅ 노션 등록 성공: [{category}] {pure_title[:25]}...", flush=True)
+        print(f"✅ 노션 등록 성공: [{category}] {title[:25]}...", flush=True)
         return True
     print(f"❌ 노션 등록 실패 ({res.status_code}): {res.text[:300]}", flush=True)
     return False
@@ -498,27 +676,39 @@ def add_to_notion(title, url, category, summary, implication, highlights, articl
 # main
 # ============================================================
 def main():
-    if not ALPHA_API_KEY or not NOTION_TOKEN or not DATABASE_ID:
-        print("환경 변수(ALPHA_API_KEY, NOTION_TOKEN, NOTION_PARENT_PAGE_ID) 설정을 확인하세요.", flush=True)
-        return
+    """반환값: 프로세스 종료 코드 (0 정상 / 1 실패 → Actions 빨간불)"""
+    missing = [k for k, v in {"ALPHA_API_KEY": ALPHA_API_KEY, "NOTION_TOKEN": NOTION_TOKEN,
+                              "NOTION_PARENT_PAGE_ID": DATABASE_ID}.items() if not v]
+    if "NOTION_TOKEN" in missing or "NOTION_PARENT_PAGE_ID" in missing:
+        print(f"❌ 환경 변수 누락: {', '.join(missing)} (GitHub Secrets 확인)", flush=True)
+        return 1
+    if "ALPHA_API_KEY" in missing:
+        print("⚠️ ALPHA_API_KEY 누락 → AI 없이 규칙 기반으로만 적재", flush=True)
     if _gn_decode is None:
         print("⚠️ googlenewsdecoder 미설치: 원문 URL 복원 불가 → 본문 수집 품질 저하", flush=True)
+
+    if not check_notion_db():
+        return 1
 
     seen_urls, seen_titles = fetch_existing_from_notion()
     candidates = collect_candidate_news(seen_urls, seen_titles)
 
     if not candidates:
-        print("신규 후보 뉴스 0건. 소스 쿼리 점검 필요.", flush=True)
-        return
+        print("❌ 신규 후보 뉴스 0건. 소스 쿼리 점검 필요.", flush=True)
+        return 1
     if len(candidates) < TARGET_COUNT:
         print(f"⚠️ 신규 후보 {len(candidates)}건뿐. 소스 쿼리 점검 권고.", flush=True)
 
     print(f"총 {len(candidates)}개 신규 후보 수집 완료. AI 선별 시작.", flush=True)
 
-    selected = select_articles(candidates)
+    selected = select_articles(candidates) if ALPHA_API_KEY else []
     if not selected:
-        print("AI 분석 결과를 가져오지 못했습니다.", flush=True)
-        return
+        if not FALLBACK_WITHOUT_AI:
+            print("❌ AI 분석 결과 없음 (FALLBACK_WITHOUT_AI=0 → 적재 중단)", flush=True)
+            return 1
+        print("⚠️ AI 분석 결과 없음 → 규칙 기반 선별로 적재", flush=True)
+    if FALLBACK_WITHOUT_AI:
+        selected = fill_rule_based(selected, candidates)
 
     saved = 0
     for d in selected:
@@ -529,14 +719,21 @@ def main():
             d["final_cat"],
             d.get("요약", ""),
             d.get("시사점", ""),
-            d["하이라이트"] or ["본문 내용 참조"],
+            d["하이라이트"] or ([] if d.get("rule_based") else ["본문 내용 참조"]),
             orig["content"],
         )
         saved += int(ok)
 
     m_cnt = sum(1 for d in selected if d["final_cat"] == "해상")
-    print(f"선별 {len(selected)}건 / 저장 {saved}건 / 해상 {m_cnt}건 완료.", flush=True)
+    ai_cnt = sum(1 for d in selected if not d.get("rule_based"))
+    print(f"선별 {len(selected)}건(AI {ai_cnt} / 규칙 {len(selected) - ai_cnt}) / "
+          f"저장 {saved}건 / 실패 {len(selected) - saved}건 / 해상 {m_cnt}건 완료.", flush=True)
+
+    if saved == 0:
+        print("❌ 노션 적재 0건", flush=True)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
