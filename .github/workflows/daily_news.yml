@@ -5,6 +5,11 @@ on:
     - cron: "30 14 * * *"   # UTC 14:30 = KST 23:30
   workflow_dispatch:
 
+# 동시 실행 방지: 실행 중에 또 실행하면 앞 실행이 끝난 뒤 시작 (노션 중복 적재 방지)
+concurrency:
+  group: daily-news-briefing
+  cancel-in-progress: false
+
 jobs:
   run-briefing:
     runs-on: ubuntu-latest
@@ -17,7 +22,7 @@ jobs:
     - name: 파이썬 설정
       uses: actions/setup-python@v5
       with:
-        python-version: '3.10'
+        python-version: '3.12'   # googlenewsdecoder 최신(0.2.x)은 3.11 이상 필요
 
     - name: 패키지 설치
       run: |
@@ -29,5 +34,6 @@ jobs:
         NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
         NOTION_PARENT_PAGE_ID: ${{ secrets.NOTION_PARENT_PAGE_ID }}
         FALLBACK_WITHOUT_AI: "1"   # AI 실패 시에도 규칙 기반으로 노션 적재 ("0"이면 실패 처리)
+        ECON_ENABLED: "1"          # 경제 기사 5건 추가 적재 ("0"이면 물류 5건만)
         PYTHONUNBUFFERED: "1"
       run: python news_briefing.py

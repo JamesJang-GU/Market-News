@@ -21,11 +21,18 @@
    · 적재 0건·설정 오류 시 exit 1 → Actions 실패(빨간불) 표시
    · 제목 이중 정제로 '아시아-유럽' 같은 제목이 잘리던 버그 수정
    · RSS를 requests로 받아 타임아웃·응답코드 로그 확보
+ - [경제 뉴스 5건 추가] 물류 5건과 별도로 경제 기사 5건 선정·적재
+   · 수집: 구글 뉴스 '비즈니스' 주요뉴스(구글 중요도 순) + 거시경제 키워드 6종
+   · 같은 사건 기사 묶기(제목 2-gram) → 사건별 보도 언론사 수 = 화제성
+   · 종합점수 = 경제 영향도(AI, 60) + 보도량(25) + 구글 주요뉴스 순위(15)
+   · 영향도 3 미만·같은 주제·세부분류 3건 이상 제외, 노션 상세에 선정 근거 표시
+   · AI 실패 시 키워드 기반 영향도로 대체
 """
 
 import os
 import re
 import sys
+import math
 import time
 import calendar
 import urllib.parse
@@ -36,13 +43,23 @@ import feedparser
 from bs4 import BeautifulSoup
 
 # --- 구글 뉴스 디코더 (신/구버전 호환) ---
+# 0.2.x(최신)는 Python 3.11 이상 필요. 3.10에서는 구버전이 설치되어 원문 URL 복원이 실패함
+_GN_IMPORT_ERROR = None
 try:
     from googlenewsdecoder import gnewsdecoder as _gn_decode          # 최신 버전
-except ImportError:
+except ImportError as _e1:
     try:
         from googlenewsdecoder import new_decoderv1 as _gn_decode     # 구버전
-    except ImportError:
+    except ImportError as _e2:
         _gn_decode = None
+        _GN_IMPORT_ERROR = f"{_e1} / {_e2}"
+try:
+    from importlib.metadata import version as _pkg_version
+    GN_VERSION = _pkg_version("googlenewsdecoder")
+except Exception:
+    GN_VERSION = "미설치"
+
+DECODE_STATS = {"ok": 0, "fail": 0, "logged": 0}   # 원문 URL 복원 통계 (실패 로그는 앞 3건만)
 
 
 def normalize_db_id(raw):
@@ -132,6 +149,47 @@ DEFAULT_MAX_AGE_HOURS = 36
 DEDUP_LOOKBACK_DAYS = 30
 TARGET_COUNT = 5
 MARITIME_MIN, MARITIME_MAX = 1, 3
+
+# --- 경제 뉴스 (물류 5건과 별도 5건) ---
+ECON_ENABLED = os.getenv("ECON_ENABLED", "1") != "0"
+ECON_COUNT = 5
+ECON_POOL = 18              # AI 평가 후보(사건) 수
+ECON_MIN_IMPACT = 3         # 기본 최소 영향도
+ECON_FILL_MIN_IMPACT = 2    # 5건 미달 시 보충 기준
+ECON_SIM = 0.45             # 같은 사건 판정 임계값 (제목 2-gram 중첩도)
+ECON_EXCLUDE_SIM = 0.7      # 노션 기존 기사·당일 물류 기사와 같은 기사 판정 임계값
+ECON_MAX_PER_SUB = 2        # 세부분류별 최대 건수 (증시 기사만 5건 되는 것 방지)
+ECON_MAX_AGE_HOURS = 36
+ECON_WEIGHTS = {"impact": 60, "coverage": 25, "google_rank": 15}   # 종합점수 100점 만점
+ECON_COVERAGE_CAP = 20      # 보도 언론사 20곳 이상이면 보도량 만점
+ECON_RANK_CAP = 30          # 구글 주요뉴스 30위 이내만 순위 가산
+
+# 구글 뉴스 '비즈니스' 주요뉴스 (한국판, 구글 중요도 순 정렬 + 관련 보도 묶음 포함)
+ECON_TOPIC_FEED = ("https://news.google.com/rss/topics/"
+                   "CAAqJggKIiBDQkFTRWdvSUwyMHZNRGx6TVdZU0FtdHZHZ0pMVWlnQVAB?hl=ko&gl=KR&ceid=KR:ko")
+ECON_QUERY_FEEDS = [gnews_rss(q) for q in [
+    "(금리 OR 기준금리 OR 한국은행 OR 연준 OR 환율)",
+    "(코스피 OR 증시 OR 주가 OR 나스닥)",
+    "(수출 OR 무역수지 OR 관세 OR 통상)",
+    "(물가 OR 유가 OR 경기 OR 성장률 OR GDP)",
+    "(부동산 OR 집값 OR 가계부채 OR 대출)",
+    "(기획재정부 OR 재정 OR 세제 OR 금융위원회 OR 공정위)",
+]]
+
+ECON_SUBCATEGORIES = ["금융·통화", "증시·투자", "무역·통상", "물가·경기",
+                      "부동산", "정책·재정", "산업·기업", "글로벌 경제"]
+# AI 미사용 시 세부분류·영향도 추정용 키워드 (위에서부터 우선 매칭)
+ECON_SUB_KEYWORDS = {
+    "금융·통화": ["기준금리", "금리", "한국은행", "한은", "연준", "환율", "원·달러", "원달러", "국채", "채권", "통화"],
+    "증시·투자": ["코스피", "코스닥", "증시", "주가", "나스닥", "S&P", "다우", "시총", "공매도", "ETF", "비트코인"],
+    "무역·통상": ["수출", "수입", "무역", "관세", "통상", "301조", "FTA", "수출통제"],
+    "물가·경기": ["물가", "CPI", "유가", "경기전망", "경기", "성장률", "GDP", "소비심리", "고용", "실업"],
+    "부동산": ["부동산", "집값", "아파트", "전세", "분양", "주택", "가계부채", "공시가격"],
+    "정책·재정": ["기획재정부", "기재부", "재정", "세제", "추경", "예산", "금융위", "공정위", "금감원"],
+    "글로벌 경제": ["미국", "중국", "일본", "유럽", "트럼프", "글로벌"],
+}
+ECON_LOW_VALUE_KEYWORDS = ["교육감", "교육청", "시위", "간담회", "개최", "협약", "수상", "축제", "기부",
+                           "봉사", "행사", "세미나", "포럼", "공모", "인사]", "부고", "운세", "날씨"]
 
 
 # ============================================================
@@ -287,23 +345,37 @@ def fetch_existing_from_notion(days=DEDUP_LOOKBACK_DAYS):
 # ============================================================
 def decode_google_news_url(url):
     """구글 뉴스 RSS 링크를 실제 언론사 원문 URL로 변환"""
-    if _gn_decode and "news.google.com" in url:
+    if "news.google.com" not in url:
+        return url
+    if _gn_decode:
         try:
             r = _gn_decode(url, interval=1)
-            if isinstance(r, dict) and r.get("status") and r.get("decoded_url"):
+            # 구버전 {"status": True, ...} / 최신 {"success": True, ...} 모두 지원
+            if isinstance(r, dict) and (r.get("success") or r.get("status")) and r.get("decoded_url"):
+                DECODE_STATS["ok"] += 1
                 return r["decoded_url"]
-            print(f"⚠️ 디코딩 실패: {r}", flush=True)
+            msg = f"⚠️ 원문 URL 복원 실패: {r}"
         except Exception as e:
-            print(f"구글 URL 디코딩 오류: {e}", flush=True)
+            msg = f"⚠️ 원문 URL 복원 오류: {type(e).__name__}: {e}"
+        DECODE_STATS["fail"] += 1
+        if DECODE_STATS["logged"] < 3:
+            DECODE_STATS["logged"] += 1
+            print(msg, flush=True)
+    else:
+        DECODE_STATS["fail"] += 1
     return url
 
 def extract_article_details(entry):
+    """RSS 항목 → (원문 URL, 본문)"""
+    return extract_from_link(entry.link, getattr(entry, "summary", ""))
+
+def extract_from_link(link, summary_html=""):
     """뉴스 원문 URL 추적 및 본문 텍스트 수집"""
     rss_snippet = ""
-    if hasattr(entry, "summary"):
-        rss_snippet = BeautifulSoup(entry.summary, "html.parser").get_text().strip()
+    if summary_html:
+        rss_snippet = BeautifulSoup(summary_html, "html.parser").get_text().strip()
 
-    real_url = decode_google_news_url(entry.link)
+    real_url = decode_google_news_url(link)
     article_text = ""
 
     try:
@@ -334,8 +406,7 @@ def extract_article_details(entry):
             article_text = "\n".join(lines)
 
         if "news.google.com" in res.url:
-            print(f"⚠️ 원문 URL 미복원 상태로 크롤링됨: {res.url[:80]}", flush=True)
-            article_text = ""
+            article_text = ""   # 구글 중간 페이지 → 본문 아님 (RSS 요약으로 대체)
     except Exception as e:
         print(f"원문 크롤링 참고 ({real_url[:80]}): {e}", flush=True)
 
@@ -487,7 +558,7 @@ def build_prompt(indexed_items, select_n, maritime_rule=True):
 - (포인트 3)
 """
 
-FIELD_RE = re.compile(r"^(후보번호|분류|요약|시사점|하이라이트)\s*[:：]\s*(.*)$")
+FIELD_RE = re.compile(r"^(후보번호|분류|경제관련|영향도|세부분류|주제|요약|시사점|하이라이트)\s*[:：]\s*(.*)$")
 BULLET_RE = re.compile(r"^[-•·*]\s*(.+)$")
 
 def parse_articles(text):
@@ -625,12 +696,20 @@ def select_articles(candidates):
 # ============================================================
 # 노션 저장
 # ============================================================
-def add_to_notion(title, url, category, summary, implication, highlights, article_content):
-    children = [
+def add_to_notion(title, url, categories, summary, implication, highlights, article_content, basis=None):
+    """categories: 분류 태그 리스트 (select 타입 DB면 첫 번째만 사용)
+    basis: 선정 근거 문구 (경제 기사용, 상단 회색 callout)"""
+    if isinstance(categories, str):
+        categories = [categories]
+    category = categories[0]
+    children = []
+    if basis:
+        children.append({"object": "block", "type": "callout", "callout": {
+            "rich_text": rt(basis), "icon": {"emoji": "📊"}, "color": "gray_background"}})
+    children.append(
         {"object": "block", "type": "callout", "callout": {
             "rich_text": rt(f"AI 시사점\n{implication}"),
-            "icon": {"emoji": "💡"}, "color": "yellow_background"}},
-    ]
+            "icon": {"emoji": "💡"}, "color": "yellow_background"}})
     highlights = [h for h in highlights if h.strip()]
     if highlights:
         children.append({"object": "block", "type": "heading_3",
@@ -647,7 +726,7 @@ def add_to_notion(title, url, category, summary, implication, highlights, articl
     if CATEGORY_TYPE == "select":
         category_value = {"select": {"name": category}}
     else:
-        category_value = {"multi_select": [{"name": category}]}
+        category_value = {"multi_select": [{"name": c} for c in dict.fromkeys(categories) if c]}
 
     payload = {
         "parent": {"database_id": DATABASE_ID},
@@ -666,36 +745,280 @@ def add_to_notion(title, url, category, summary, implication, highlights, articl
         print(f"❌ 노션 요청 오류(네트워크): {title[:25]}", flush=True)
         return False
     if res.status_code == 200:
-        print(f"✅ 노션 등록 성공: [{category}] {title[:25]}...", flush=True)
+        print(f"✅ 노션 등록 성공: [{'/'.join(categories)}] {title[:25]}...", flush=True)
         return True
     print(f"❌ 노션 등록 실패 ({res.status_code}): {res.text[:300]}", flush=True)
     return False
+
+# ============================================================
+# 경제 뉴스 (추가 5건): 경제 영향도 + 화제성 기반 순위
+# ============================================================
+def bigrams(text):
+    t = norm_title(text)
+    return {t[i:i + 2] for i in range(len(t) - 1)}
+
+def overlap(a, b):
+    """제목 2-gram 중첩도 (짧은 쪽 기준, 0~1)"""
+    if not a or not b:
+        return 0.0
+    return len(a & b) / min(len(a), len(b))
+
+def entry_source(e):
+    src = (e.get("source") or {}).get("title")
+    if src:
+        return src
+    m = re.search(r"\s+-\s+([^-]+)$", e.get("title", ""))
+    return m.group(1).strip() if m else ""
+
+def keyword_sub(title):
+    for sub, kws in ECON_SUB_KEYWORDS.items():
+        if any(k in title for k in kws):
+            return sub
+    return "산업·기업"
+
+def heuristic_impact(story):
+    """AI 미사용 시 영향도 추정: 거시 키워드·보도량·주요뉴스 순위 기반 (1~5)"""
+    title = story["rep"]["title"]
+    macro = any(k in title for sub, kws in ECON_SUB_KEYWORDS.items()
+                if sub != "글로벌 경제" for k in kws)
+    score = 3 if macro else 2
+    if story["coverage"] >= 10 or (story["g_rank"] and story["g_rank"] <= 5):
+        score += 1
+    if any(k in title for k in ECON_LOW_VALUE_KEYWORDS):
+        score -= 1
+    return max(1, min(5, score))
+
+def econ_score(impact, coverage, g_rank):
+    """종합점수(100점) = 영향도 60 + 보도량 25 + 구글 주요뉴스 순위 15"""
+    w = ECON_WEIGHTS
+    s = w["impact"] * impact / 5
+    s += w["coverage"] * min(1.0, math.log1p(coverage) / math.log1p(ECON_COVERAGE_CAP))
+    if g_rank and g_rank <= ECON_RANK_CAP:
+        s += w["google_rank"] * (ECON_RANK_CAP - g_rank + 1) / ECON_RANK_CAP
+    return round(s, 1)
+
+def collect_econ_stories(exclude_urls, exclude_titles):
+    """경제 기사 수집 → 같은 사건끼리 묶어 사건(story) 단위로 반환 (사전점수 순)"""
+    now = datetime.now(timezone.utc)
+    max_age = timedelta(hours=ECON_MAX_AGE_HOURS)
+    items, seen_links = [], set()
+
+    def add_item(raw_title, link, source, summary, g_rank, pub):
+        title = clean_title(raw_title)
+        if not link or link in seen_links or len(norm_title(title)) < 10:
+            return
+        seen_links.add(link)
+        items.append({"title": title, "link": link, "source": source or "",
+                      "summary": summary or "", "g_rank": g_rank, "pub": pub, "bg": bigrams(title)})
+
+    # 1) 구글 '비즈니스' 주요뉴스: 순위 + 묶음 내 관련 보도(다른 언론사)
+    topic_entries = fetch_feed(ECON_TOPIC_FEED, "경제·주요뉴스")
+    for rank, e in enumerate(topic_entries, start=1):
+        pub = entry_time(e)
+        if pub and now - pub > max_age:
+            continue
+        add_item(e.get("title", ""), e.get("link"), entry_source(e), e.get("summary", ""), rank, pub)
+        for li in BeautifulSoup(e.get("summary", ""), "html.parser").find_all("li"):
+            a, f = li.find("a"), li.find("font")
+            if a and a.get("href"):
+                add_item(a.get_text(), a["href"], f.get_text(strip=True) if f else "", "", None, pub)
+    # 2) 거시경제 키워드 검색
+    n_query = 0
+    for u in ECON_QUERY_FEEDS:
+        for e in fetch_feed(u, "경제·키워드"):
+            pub = entry_time(e)
+            if pub and now - pub > max_age:
+                continue
+            add_item(e.get("title", ""), e.get("link"), entry_source(e), e.get("summary", ""), None, pub)
+            n_query += 1
+    print(f"[경제] 주요뉴스 {len(topic_entries)}건 / 키워드 {n_query}건 → 기사 {len(items)}건", flush=True)
+
+    # 3) 같은 사건 묶기 (제목 2-gram 중첩도)
+    stories = []
+    for it in items:
+        for st in stories:
+            if any(overlap(it["bg"], m["bg"]) >= ECON_SIM for m in st["members"][:6]):
+                st["members"].append(it)
+                break
+        else:
+            stories.append({"members": [it]})
+
+    # 4) 사건별 지표 + 기존 노션/당일 물류 기사 제외
+    excl_bg = [bigrams(t) for t in exclude_titles if t]
+    result, excluded = [], 0
+    for st in stories:
+        ms = st["members"]
+        ranked = [m for m in ms if m["g_rank"]]
+        st["rep"] = min(ranked, key=lambda m: m["g_rank"]) if ranked else ms[0]
+        st["g_rank"] = st["rep"]["g_rank"]
+        st["coverage"] = len({m["source"] for m in ms if m["source"]}) or 1
+        if (any(m["link"] in exclude_urls for m in ms)
+                or any(overlap(st["rep"]["bg"], b) >= ECON_EXCLUDE_SIM for b in excl_bg)):
+            excluded += 1
+            continue
+        st["prescore"] = econ_score(heuristic_impact(st), st["coverage"], st["g_rank"])
+        result.append(st)
+
+    result.sort(key=lambda s: s["prescore"], reverse=True)
+    print(f"[경제] 사건 {len(stories)}개 (기존/물류 중복 제외 {excluded}) → 평가 후보 {min(len(result), ECON_POOL)}개",
+          flush=True)
+    return result[:ECON_POOL]
+
+def build_econ_prompt(pool):
+    payload = ""
+    for i, st in enumerate(pool, start=1):
+        payload += (f"---후보 기사 {i}---\n제목: {st['rep']['title']}\n"
+                    f"보도 언론사 수: {st['coverage']}\n본문: {st['content'][:500]}\n\n")
+    subs = ", ".join(ECON_SUBCATEGORIES)
+    return f"""
+당신은 거시경제·금융시장 전문 애널리스트입니다. 아래 후보 기사 {len(pool)}개를 '모두' 평가하세요.
+
+[후보 기사 목록]
+{payload}
+[영향도 기준] 한국 경제·금융시장·기업 경영에 미치는 실질 영향
+5: 금리·환율·증시·유가 급변, 국가 단위 정책·통상 조치, 주요 거시지표 충격 → 즉시 주목 필요
+4: 업종 전반·주요 지표에 중기적으로 유의미한 영향
+3: 참고할 경제 동향
+2: 영향 제한적 (개별 기업 소식, 지역·행사·홍보성)
+1: 경제와 무관 (연예·가십·사건사고 등)
+
+[작성 규칙]
+1. 경제관련: 예 / 아니오
+2. 영향도: 1~5 숫자만
+3. 세부분류: 다음 중 1개 [{subs}]
+4. 주제: 같은 사건이면 같은 문구가 되도록 핵심 주제를 10자 내외로 (예: 엔비디아 CEO 복귀)
+5. 요약: 핵심 내용 1문장 (명사형 어미)
+6. 시사점: 한국 경제·시장 관점 영향 1문장 (명사형 어미)
+7. 하이라이트: 핵심 포인트 3개 (명사형 어미)
+8. 마크다운 굵게(**), 제목(#) 사용 금지. 평가 근거 설명 없이 결과 양식만 출력.
+
+[응답 양식]
+---ARTICLE---
+후보번호: (숫자)
+경제관련: (예/아니오)
+영향도: (1~5)
+세부분류: (택1)
+주제: (10자 내외)
+요약: (1문장)
+시사점: (1문장)
+하이라이트:
+- (포인트 1)
+- (포인트 2)
+- (포인트 3)
+"""
+
+def evaluate_econ(pool):
+    """AI 평가 (실패 시 키워드 기반) → 각 story에 impact/sub/topic/summary 등 기록"""
+    ai = {}
+    if ALPHA_API_KEY and pool:
+        content = call_llm(build_econ_prompt(pool))
+        if content:
+            for d in parse_articles(content):
+                idx = d.get("후보번호")
+                if idx and 1 <= idx <= len(pool) and idx not in ai:
+                    ai[idx] = d
+        print(f"[경제] AI 평가 {len(ai)}/{len(pool)}건", flush=True)
+
+    for i, st in enumerate(pool, start=1):
+        d = ai.get(i)
+        title = st["rep"]["title"]
+        if d:
+            m = re.search(r"[1-5]", d.get("영향도", ""))
+            impact = int(m.group()) if m else heuristic_impact(st)
+            if (d.get("경제관련") or "").strip().startswith("아니"):
+                impact = 1
+            sub = next((s for s in ECON_SUBCATEGORIES if s in (d.get("세부분류") or "")), keyword_sub(title))
+            st.update(impact=impact, sub=sub, ai=True,
+                      topic=d.get("주제") or title,
+                      summary=d.get("요약") or first_sentence(st["content"]) or title,
+                      implication=d.get("시사점") or "",
+                      highlights=d.get("하이라이트") or [])
+        else:
+            st.update(impact=heuristic_impact(st), sub=keyword_sub(title), ai=False, topic=title,
+                      summary=first_sentence(st["content"]) or title,
+                      implication="AI 분석 미수행 – 원문 확인 필요", highlights=[])
+        st["score"] = econ_score(st["impact"], st["coverage"], st["g_rank"])
+    return pool
+
+def rank_econ(pool):
+    """종합점수 순 선정: 최소 영향도 → 주제 중복 제외 → 세부분류 상한. 미달 시 보충 기준으로 재시도"""
+    ordered = sorted(pool, key=lambda s: (s["score"], s["coverage"]), reverse=True)
+    selected = []
+
+    def is_dup(st):
+        tb, rb = bigrams(st["topic"]), st["rep"]["bg"]
+        return any(norm_title(st["topic"]) == norm_title(x["topic"])
+                   or overlap(tb, bigrams(x["topic"])) >= 0.6
+                   or overlap(rb, x["rep"]["bg"]) >= ECON_SIM for x in selected)
+
+    for min_impact in (ECON_MIN_IMPACT, ECON_FILL_MIN_IMPACT):
+        for st in ordered:
+            if len(selected) >= ECON_COUNT:
+                break
+            if st in selected or st["impact"] < min_impact or is_dup(st):
+                continue
+            if sum(1 for x in selected if x["sub"] == st["sub"]) >= ECON_MAX_PER_SUB:
+                continue
+            if min_impact < ECON_MIN_IMPACT:
+                print(f"ℹ️ [경제] 영향도 {st['impact']} 기사로 보충: {st['rep']['title'][:30]}", flush=True)
+            selected.append(st)
+    return selected
+
+def econ_basis(st):
+    parts = [f"경제 영향도 {st['impact']}/5" + ("" if st["ai"] else "(키워드 추정)"),
+             f"관련 보도 {st['coverage']}곳"]
+    if st["g_rank"]:
+        parts.append(f"구글 비즈니스 주요뉴스 {st['g_rank']}위")
+    w = ECON_WEIGHTS
+    return (f"선정 근거: {' · '.join(parts)} → 종합 {st['score']}점\n"
+            f"(종합점수 = 영향도 {w['impact']} + 보도량 {w['coverage']} + 주요뉴스 순위 {w['google_rank']}, 100점 만점)")
+
+def run_econ(exclude_urls, exclude_titles):
+    """경제 기사 5건 선정·적재. 반환: (저장 건수, 시도 건수)"""
+    print("\n===== 경제 뉴스 선정 =====", flush=True)
+    pool = collect_econ_stories(exclude_urls, exclude_titles)
+    if not pool:
+        print("❌ [경제] 후보 0건. 경제 RSS 점검 필요.", flush=True)
+        return 0, 0
+
+    # 원문 URL 복원·본문 수집 (복원 후 기존 기사와 URL 중복이면 제외)
+    kept = []
+    for st in pool:
+        st["url"], st["content"] = extract_from_link(st["rep"]["link"], st["rep"]["summary"])
+        if st["url"] in exclude_urls:
+            continue
+        kept.append(st)
+
+    selected = rank_econ(evaluate_econ(kept))
+    print("[경제] 선정 순위:", flush=True)
+    for i, st in enumerate(selected, start=1):
+        print(f"  {i}. {st['score']}점 (영향도 {st['impact']}, 보도 {st['coverage']}곳, "
+              f"주요뉴스 {st['g_rank'] or '-'}위, {st['sub']}) {st['rep']['title'][:40]}", flush=True)
+
+    saved = 0
+    for st in selected:
+        ok = add_to_notion(
+            st["rep"]["title"], st["url"], ["경제", st["sub"]],
+            st["summary"], st["implication"], st["highlights"], st["content"],
+            basis=econ_basis(st),
+        )
+        saved += int(ok)
+    ai_cnt = sum(1 for st in selected if st["ai"])
+    print(f"[경제] 선정 {len(selected)}건(AI 평가 {ai_cnt}) / 저장 {saved}건 / 실패 {len(selected) - saved}건",
+          flush=True)
+    return saved, len(selected)
 
 
 # ============================================================
 # main
 # ============================================================
-def main():
-    """반환값: 프로세스 종료 코드 (0 정상 / 1 실패 → Actions 빨간불)"""
-    missing = [k for k, v in {"ALPHA_API_KEY": ALPHA_API_KEY, "NOTION_TOKEN": NOTION_TOKEN,
-                              "NOTION_PARENT_PAGE_ID": DATABASE_ID}.items() if not v]
-    if "NOTION_TOKEN" in missing or "NOTION_PARENT_PAGE_ID" in missing:
-        print(f"❌ 환경 변수 누락: {', '.join(missing)} (GitHub Secrets 확인)", flush=True)
-        return 1
-    if "ALPHA_API_KEY" in missing:
-        print("⚠️ ALPHA_API_KEY 누락 → AI 없이 규칙 기반으로만 적재", flush=True)
-    if _gn_decode is None:
-        print("⚠️ googlenewsdecoder 미설치: 원문 URL 복원 불가 → 본문 수집 품질 저하", flush=True)
-
-    if not check_notion_db():
-        return 1
-
-    seen_urls, seen_titles = fetch_existing_from_notion()
+def run_logistics(seen_urls, seen_titles):
+    """물류 기사 5건 선정·적재. 반환: (저장 건수, 시도 건수, 사용 후보 목록)"""
+    print("\n===== 물류 뉴스 선정 =====", flush=True)
     candidates = collect_candidate_news(seen_urls, seen_titles)
-
     if not candidates:
         print("❌ 신규 후보 뉴스 0건. 소스 쿼리 점검 필요.", flush=True)
-        return 1
+        return 0, 0, []
     if len(candidates) < TARGET_COUNT:
         print(f"⚠️ 신규 후보 {len(candidates)}건뿐. 소스 쿼리 점검 권고.", flush=True)
 
@@ -705,7 +1028,7 @@ def main():
     if not selected:
         if not FALLBACK_WITHOUT_AI:
             print("❌ AI 분석 결과 없음 (FALLBACK_WITHOUT_AI=0 → 적재 중단)", flush=True)
-            return 1
+            return 0, 0, candidates
         print("⚠️ AI 분석 결과 없음 → 규칙 기반 선별로 적재", flush=True)
     if FALLBACK_WITHOUT_AI:
         selected = fill_rule_based(selected, candidates)
@@ -716,7 +1039,7 @@ def main():
         ok = add_to_notion(
             orig["title"],
             orig["link"],
-            d["final_cat"],
+            [d["final_cat"]],
             d.get("요약", ""),
             d.get("시사점", ""),
             d["하이라이트"] or ([] if d.get("rule_based") else ["본문 내용 참조"]),
@@ -728,9 +1051,51 @@ def main():
     ai_cnt = sum(1 for d in selected if not d.get("rule_based"))
     print(f"선별 {len(selected)}건(AI {ai_cnt} / 규칙 {len(selected) - ai_cnt}) / "
           f"저장 {saved}건 / 실패 {len(selected) - saved}건 / 해상 {m_cnt}건 완료.", flush=True)
+    return saved, len(selected), candidates
 
-    if saved == 0:
-        print("❌ 노션 적재 0건", flush=True)
+
+def main():
+    """반환값: 프로세스 종료 코드 (0 정상 / 1 실패 → Actions 빨간불)"""
+    missing = [k for k, v in {"ALPHA_API_KEY": ALPHA_API_KEY, "NOTION_TOKEN": NOTION_TOKEN,
+                              "NOTION_PARENT_PAGE_ID": DATABASE_ID}.items() if not v]
+    if "NOTION_TOKEN" in missing or "NOTION_PARENT_PAGE_ID" in missing:
+        print(f"❌ 환경 변수 누락: {', '.join(missing)} (GitHub Secrets 확인)", flush=True)
+        return 1
+    if "ALPHA_API_KEY" in missing:
+        print("⚠️ ALPHA_API_KEY 누락 → AI 없이 규칙 기반으로만 적재", flush=True)
+    print(f"Python {sys.version.split()[0]} / googlenewsdecoder {GN_VERSION}", flush=True)
+    if _gn_decode is None:
+        print(f"⚠️ googlenewsdecoder 로드 실패({_GN_IMPORT_ERROR}): 원문 URL 복원 불가 → 본문 수집 품질 저하",
+              flush=True)
+
+    if not check_notion_db():
+        return 1
+
+    seen_urls, seen_titles = fetch_existing_from_notion()
+
+    log_saved, log_tried, log_cands = run_logistics(seen_urls, seen_titles)
+
+    econ_saved = econ_tried = 0
+    if ECON_ENABLED:
+        # 오늘 물류 후보로 쓴 기사는 경제 쪽에서 제외 (같은 기사 이중 적재 방지)
+        excl_urls = set(seen_urls) | {c["link"] for c in log_cands}
+        excl_titles = set(seen_titles) | {norm_title(c["title"]) for c in log_cands}
+        econ_saved, econ_tried = run_econ(excl_urls, excl_titles)
+
+    print(f"\n===== 결과: 물류 {log_saved}/{log_tried}건 · 경제 {econ_saved}/{econ_tried}건 저장 =====",
+          flush=True)
+    total = DECODE_STATS["ok"] + DECODE_STATS["fail"]
+    if total:
+        print(f"원문 URL 복원 {DECODE_STATS['ok']}/{total}건"
+              + ("  ← ⚠️ 복원 실패 많음: 본문 대신 RSS 요약 저장됨" if DECODE_STATS["ok"] < total / 2 else ""),
+              flush=True)
+    failed = []
+    if log_saved == 0:
+        failed.append("물류")
+    if ECON_ENABLED and econ_saved == 0:
+        failed.append("경제")
+    if failed:
+        print(f"❌ 노션 적재 0건: {', '.join(failed)}", flush=True)
         return 1
     return 0
 
